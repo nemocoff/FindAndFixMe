@@ -1,4 +1,5 @@
 from typing import List, Dict, Any
+import multiprocessing
 
 class TraceDBManager:
     """
@@ -12,6 +13,18 @@ class TraceDBManager:
         
     def init_db(self) -> None:
         raise NotImplementedError("TODO: Create SQLite tables for Traces and History using sqlite3 framework.")
+
+    def start_listener(self, queue: multiprocessing.Queue) -> None:
+        """
+        [통합 필수 요건] 퍼징 프로세스 단일 채널 통신망 구축 (SQlite 'Database is locked' 크래시 방어)
+        다건의 동시성 퍼징 샌드박스들이 DB에 동시 쓰기를 요청하다 폭주하는 것을 막기 위해, 
+        본 DB Manager만 단독으로 백그라운드 스레드에서 `queue.get()`을 사용하여 일괄 Insert 처리합니다.
+        """
+        raise NotImplementedError(
+            "TODO: 1) Create a background listener loop pulling from multiprocessing.Queue. "
+            "2) Collect incoming TraceNode hashes/hit_counts from multiple isolated tracer sandboxes. "
+            "3) Execute bulk SQLite INSERTs transactions linearly using a single connection lock."
+        )
 
     def get_history(self, target_file: str) -> List[Dict[str, Any]]:
         """

@@ -11,6 +11,7 @@ class TraceNode:
     code_snippet: str
     hit_count: int
     is_corner_case: bool  # [Req 2.1] 트레이스 상에서 실행 빈도 1% 미만이거나 미개척된 분기점을 코너 케이스 후보군으로 추출
+    observed_types: Dict[str, str] = field(default_factory=dict) # [신뢰성 향상] 동적 타입 추론을 위한 변수별 런타임 타입 스냅샷 기록
     children: List['TraceNode'] = field(default_factory=list)
 
 @dataclass
@@ -25,6 +26,6 @@ class InjectionResult:
 @dataclass
 class EvaluationReport:
     fuzzing_survival_rate: float   # [Req 7.1] 파이썬 퍼저(Atheris) 백그라운드 실행 결함 생존율 (0.0 - 100.0)
-    llm_score: float               # [Req 7.2] Gemini API 연동하여 코드의 자연스러움을 평가
-    llm_rationale: str             # Feedback text from Gemini
+    llm_score: Optional[float]     # [Req 7.2] Gemini API 연동 (사용자 선택 시에만 할당됨)
+    llm_rationale: Optional[str]   # Feedback text from Gemini (사용자 선택 시에만 할당됨)
     pdf_report_path: Optional[str] = None # [Req 7.3] 종합 PDF 리포트 자동 생성

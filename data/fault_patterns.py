@@ -1,10 +1,19 @@
 import libcst as cst
+from typing import List
 
 class HumanErrorPatterns:
     """
     Pattern library for semantic bug injections via libcst transformers.
     """
     
+    @staticmethod
+    def get_required_imports(pattern: str) -> List[str]:
+        """
+        각 결함 패턴별로 강제 주입되어야 하는 파이썬 모듈 리스트를 반환합니다.
+        (예: 패턴 C -> ['copy'])
+        """
+        raise NotImplementedError("TODO: Implement mapping from pattern name to its required module imports (e.g. pattern_c returns ['copy'])")
+
     @staticmethod
     def apply_pattern_a(node: cst.CSTNode) -> cst.CSTNode:
         """
@@ -22,9 +31,10 @@ class HumanErrorPatterns:
     @staticmethod
     def apply_pattern_c(node: cst.CSTNode) -> cst.CSTNode:
         """
-        [Req 4.3] [패턴 C] 깊은 복사 오류: copy.deepcopy()를 단순 할당(=)으로 변조하여 참조 덮어쓰기 유발
+        [Req 4.3] [패턴 C] 깊은 복사 오류: copy.deepcopy()를 단순 할당(=)으로 변조하거나 주입하여 참조 덮어쓰기 유발
+        [신뢰성 향상] FaultInjectionEngine.inject_with_safety() 에서 이 패턴을 사용할 때, ast_engine이 자동으로 'import copy'를 주입하게 됨.
         """
-        raise NotImplementedError("TODO: Implement CSTTransformer to match Call node containing 'deepcopy' and replace with Assignment node.")
+        raise NotImplementedError("TODO: Implement CSTTransformer to match Call node containing 'deepcopy' and replace with Assignment node, or inject deepcopy over standard assignments.")
 
     @staticmethod
     def apply_pattern_d(node: cst.CSTNode) -> cst.CSTNode:
