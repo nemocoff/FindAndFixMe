@@ -4,3 +4,4 @@ z3-solver
 atheris
 streamlit
 google-generativeai
+streamlit-echarts
