@@ -182,7 +182,16 @@ def main() -> None:
             target_file = st.file_uploader("Upload Target Source (`target_source_code.py`)", type=["py"])
         with col_file2:
             harness_file = st.file_uploader("Upload Test Harness (`test_harness_wrapper.py`)", type=["py"])
+        
+        if "last_uploaded" not in st.session_state:
+            st.session_state['last_uploaded'] = None
 
+        if target_file and target_file.name != st.session_state['last_uploaded']:
+            # 파일이 변경되었으므로 기존 분석 결과 삭제
+            st.session_state.pop('trace_data', None)
+            st.session_state.pop('corner_cases', None)
+            st.session_state['last_uploaded'] = target_file.name
+            
         if target_file and harness_file:
             target_code = target_file.getvalue().decode("utf-8")
             harness_code = harness_file.getvalue().decode("utf-8")
