@@ -1,6 +1,6 @@
-libcst
-crosshair-tool
-z3-solver
-atheris
+fastapi
+uvicorn
+python-multipart
 streamlit
+requests
 google-generativeai

@@ -1,8 +1,7 @@
-Prompt.md
+# Ignore Brainstorming and Project Docs
+prompt.md
 브레인스토밍.docx
 brainstorming.txt
-sample_target.py
-test_engine.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
