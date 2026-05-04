@@ -140,8 +140,40 @@ async def inject_mutation(req: MutationInjectRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 def async_validation_task(mutant_id: int):
-    # TODO: AFL++ 생존율 측정 및 Gemini API 호출 정성 평가
-    pass
+    """
+    백그라운드에서 실행되는 결함 검증 태스크
+    - AFL++ 생존율(Survival Rate) 측정
+    - 생존율 95% 이상 시 LLM 정성 평가 수행
+    """
+    try:
+        # TODO: 1. AFL++를 돌려 원래 코드와 변조 코드의 커버리지/크래시 비율을 비교 (Mock 데이터 96.5%)
+        mock_survival_rate = 96.5
+        
+        # 2. 결함 생존율 95% 체크 로직
+        is_stealthy = mock_survival_rate >= 95.0
+        
+        naturalness_score = 0
+        if is_stealthy:
+            # TODO: 3. 생존율이 95% 이상인 경우에만 Gemini API를 호출하여 코드 자연스러움(0~100) 평가
+            # response = requests.post("https://generativelanguage.googleapis.com/...", ...)
+            naturalness_score = 85  # Mock LLM Score
+            
+        # 4. DB에 검증 결과 업데이트 (MutantRecord 등)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # MutantRecord 테이블에 survival_rate와 llm_score 컬럼이 있다고 가정
+            # cursor.execute("UPDATE MutantRecord SET survival_rate=?, llm_score=? WHERE id=?", 
+            #                (mock_survival_rate, naturalness_score, mutant_id))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"DB Update Error in Background Task: {e}")
+        finally:
+            conn.close()
+            
+    except Exception as e:
+        print(f"Validation Task Failed: {e}")
 
 @app.post("/api/v1/mutations/{mutant_id}/validate")
 async def validate_mutant(mutant_id: int, background_tasks: BackgroundTasks):

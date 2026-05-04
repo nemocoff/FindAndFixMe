@@ -25,5 +25,5 @@ make
 echo ""
 echo "Installation Complete!"
 echo "To start the system, open two terminals:"
-echo "1. uvicorn frontend.api:app --reload (FastAPI Backend)"
+echo "1. uvicorn backend.api:app --reload (FastAPI Backend)"
 echo "2. streamlit run frontend/app.py (Streamlit Frontend)"
