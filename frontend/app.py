@@ -1,20 +1,9 @@
 import streamlit as st
-import requests
-import time
-import os
+from api_client import fetch_mock_analysis_result, fetch_history
+from components.trace_tree import render_trace_tree_and_table
+from components.diff_viewer import render_diff_viewer
 
 API_BASE_URL = "http://localhost:8000/api/v1"
-
-def render_diff_viewer(old_code: str, new_code: str):
-    """GitHub 스타일의 Side-by-Side Diff 뷰어"""
-    st.markdown("##### 🔍 Code Diff Viewer")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Original Code (AS-IS)**")
-        st.code(old_code, language="cpp")
-    with col2:
-        st.markdown("**Injected Code (TO-BE)**")
-        st.code(new_code, language="cpp")
 
 def main() -> None:
     """
@@ -38,18 +27,15 @@ def main() -> None:
             if st.button("Run C++ AST Analysis & Inject Bugs", type="primary"):
                 with st.spinner("Calling Core C++ Engine via API..."):
                     try:
-                        # Assuming API accepts file upload
-                        files = {"file": (target_file.name, target_file.getvalue())}
-                        response = requests.post(f"{API_BASE_URL}/analyze", files=files)
-                        if response.status_code == 200:
-                            st.session_state["analysis_result"] = response.json()
-                            st.success("AST Analysis & Injection complete!")
-                        else:
-                            st.error(f"API Error: {response.text}")
+                        # 세션에 가짜 응답을 저장하여 UI 렌더링 트리거
+                        st.session_state["analysis_result"] = fetch_mock_analysis_result()
+                        st.success("AST Analysis & Injection complete! (Mock Mode 켜짐 🟢)")
                     except Exception as e:
                         st.error(f"Connection Error: Ensure FastAPI is running on {API_BASE_URL}. Exception: {e}")
 
         if st.session_state["analysis_result"] and st.session_state["analysis_result"].get("status") == "success":
+            st.markdown("---")
+            render_trace_tree_and_table()
             st.markdown("---")
             st.markdown("### 2. Analysis Results & Diff Viewer")
             
@@ -83,7 +69,7 @@ def main() -> None:
         st.markdown("### Injection History")
         if st.button("Refresh History"):
             try:
-                response = requests.get(f"{API_BASE_URL}/history")
+                response = fetch_history()
                 if response.status_code == 200:
                     st.json(response.json())
             except Exception as e:
