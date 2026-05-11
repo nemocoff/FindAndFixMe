@@ -4,7 +4,7 @@ echo "Installing FindAndFixMe Dependencies for WSL/Linux (C++ Migration)..."
 # 1. Install C++ Dependencies (LLVM 16, Clang, Z3, CMake, AFL++)
 echo "Installing System Dependencies (Requires sudo)..."
 sudo apt-get update
-sudo apt-get install -y cmake build-essential python3-dev
+sudo apt-get install -y cmake build-essential python3-dev libzstd-dev libcurl4-openssl-dev
 sudo apt-get install -y llvm-16 clang-16 libclang-16-dev
 sudo apt-get install -y libz3-dev z3
 sudo apt-get install -y afl++

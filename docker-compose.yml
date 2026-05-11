@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  # FastAPI 백엔드 서버
+  backend:
+    image: python:3.10-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+      - afl_outputs:/app/afl_output
+    ports:
+      - "8000:8000"
+    environment:
+      - AFL_OUTPUT_BASE=/app/afl_output
+      - TEMP_TARGETS_DIR=/app/temp_targets
+      - MUTATION_ENGINE_BIN=/app/core/build/MutationEngine
+    command: >
+      sh -c "pip install -r requirements.txt -q &&
+             uvicorn backend.api:app --host 0.0.0.0 --port 8000 --reload"
+    depends_on:
+      - sandbox
+
+  # AFL++ 퍼징 샌드박스 컨테이너
+  sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+    privileged: true                   # AFL++ 커널 자원 접근 필요
+    volumes:
+      - ./temp_targets:/sandbox/targets:ro
+      - afl_outputs:/sandbox/outputs
+      - ./core/build:/sandbox/binaries:ro
+    stdin_open: true
+    tty: true
+
+volumes:
+  afl_outputs:

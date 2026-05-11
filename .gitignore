@@ -1,7 +1,13 @@
 # Ignore Brainstorming and Project Docs
 prompt.md
+reset_and_test.sh
 브레인스토밍.docx
 brainstorming.txt
+test_pipeline.py
+core/test_target.cpp
+inspect_mutations.py
+afl_output/
+temp_targets/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

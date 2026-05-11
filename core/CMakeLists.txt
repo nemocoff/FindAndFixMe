@@ -10,7 +10,7 @@ message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
 # Find Clang
-find_package(Clang REQUIRED CONFIG)
+find_package(Clang 16 REQUIRED CONFIG)
 
 # Include directories
 include_directories(${LLVM_INCLUDE_DIRS})
@@ -26,23 +26,10 @@ include_directories(${Z3_INCLUDE_DIRS})
 # Set up the executable
 add_executable(MutationEngine MutationEngine.cpp)
 
-# Link libraries
-llvm_map_components_to_libnames(llvm_libs Support Core IRReader)
-
+# Link libraries (Using Dynamic Libraries to prevent duplicate CLI option registration)
 target_link_libraries(MutationEngine
-    clangTooling
-    clangBasic
-    clangAST
-    clangASTMatchers
-    clangRewrite
-    clangFrontend
-    clangSerialization
-    clangDriver
-    clangParse
-    clangSema
-    clangAnalysis
-    clangEdit
-    clangLex
-    ${llvm_libs}
+    PRIVATE
+    clang-cpp
+    LLVM
     ${Z3_LIBRARIES}
 )

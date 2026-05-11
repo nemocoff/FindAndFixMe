@@ -1,0 +1,27 @@
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    afl++ \
+    clang-16 \
+    llvm-16 \
+    libclang-16-dev \
+    libz3-dev z3 \
+    cmake build-essential \
+    python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# AFL++ 환경 설정 (UI 비활성화, CPU 주파수 스킵)
+ENV AFL_NO_UI=1
+ENV AFL_SKIP_CPUFREQ=1
+ENV AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
+
+WORKDIR /sandbox
+RUN mkdir -p /sandbox/inputs /sandbox/outputs /sandbox/targets /sandbox/binaries
+
+# afl-clang++ wrapper 경로 확인
+RUN ln -sf /usr/bin/afl-clang++-16 /usr/local/bin/afl-clang++ 2>/dev/null || true
+RUN ln -sf /usr/bin/clang++-16 /usr/local/bin/clang++ 2>/dev/null || true
+
+CMD ["/bin/bash"]
