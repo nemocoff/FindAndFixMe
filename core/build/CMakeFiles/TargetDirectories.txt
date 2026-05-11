@@ -1,0 +1,8 @@
+/mnt/d/FindAndFixMe/core/build/CMakeFiles/intrinsics_gen.dir
+/mnt/d/FindAndFixMe/core/build/CMakeFiles/omp_gen.dir
+/mnt/d/FindAndFixMe/core/build/CMakeFiles/acc_gen.dir
+/mnt/d/FindAndFixMe/core/build/CMakeFiles/RISCVTargetParserTableGen.dir
+/mnt/d/FindAndFixMe/core/build/CMakeFiles/clang-tablegen-targets.dir
+/mnt/d/FindAndFixMe/core/build/CMakeFiles/MutationEngine.dir
+/mnt/d/FindAndFixMe/core/build/CMakeFiles/edit_cache.dir
+/mnt/d/FindAndFixMe/core/build/CMakeFiles/rebuild_cache.dir

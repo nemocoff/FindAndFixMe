@@ -22,13 +22,19 @@ static llvm::cl::OptionCategory FindAndFixMeCategory("FindAndFixMe Options");
 // CWE-190 & CWE-193 MatchCallback
 class FaultInjectionCallback : public MatchFinder::MatchCallback {
 private:
-    Rewriter &Rewrite;
+    Rewriter *Rewrite;
     std::vector<std::string> &mutations_log;
 
 public:
-    FaultInjectionCallback(Rewriter &R, std::vector<std::string> &log) : Rewrite(R), mutations_log(log) {}
+    FaultInjectionCallback(std::vector<std::string> &log) : Rewrite(nullptr), mutations_log(log) {}
+
+    void setRewriter(Rewriter &R) {
+        Rewrite = &R;
+    }
 
     virtual void run(const MatchFinder::MatchResult &Result) override {
+        if  (!Rewrite) return; // Ensure Rewriter is set
+        
         ASTContext *Context = Result.Context;
         const SourceManager &SM = Context->getSourceManager();
 
@@ -37,7 +43,7 @@ public:
             if (BinOp->getOpcode() == BO_Add) {
                 // Draft Mutation: Replace entire expression with a boundary violation
                 SourceRange range = BinOp->getSourceRange();
-                Rewrite.ReplaceText(range, "2147483647 + 1 /* Injected CWE-190 */");
+                Rewrite->ReplaceText(range, "2147483647 + 1 /* Injected CWE-190 */");
                 mutations_log.push_back("{\"pattern_id\": 1, \"pattern_name\": \"CWE-190 Integer Overflow\", \"status\": \"injected\"}");
             }
         }
@@ -46,11 +52,11 @@ public:
         if (const BinaryOperator *BinOp = Result.Nodes.getNodeAs<clang::BinaryOperator>("cwe193")) {
             if (BinOp->getOpcode() == BO_LT) { // '<'
                 SourceLocation opLoc = BinOp->getOperatorLoc();
-                Rewrite.ReplaceText(opLoc, 1, "<=");
+                Rewrite->ReplaceText(opLoc, 1, "<=");
                 mutations_log.push_back("{\"pattern_id\": 2, \"pattern_name\": \"CWE-193 Boundary Condition Error\", \"status\": \"injected\"}");
             } else if (BinOp->getOpcode() == BO_LE) { // '<='
                 SourceLocation opLoc = BinOp->getOperatorLoc();
-                Rewrite.ReplaceText(opLoc, 2, "<");
+                Rewrite->ReplaceText(opLoc, 2, "<");
                 mutations_log.push_back("{\"pattern_id\": 2, \"pattern_name\": \"CWE-193 Boundary Condition Error\", \"status\": \"injected\"}");
             }
         }
@@ -114,14 +120,24 @@ public:
             std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI, StringRef file) override {
                 TheRewriter.setSourceMgr(CI.getSourceManager(), CI.getLangOpts());
                 // Link Rewriter to Callback
-                *Callback = FaultInjectionCallback(TheRewriter, Callback->mutations_log);
+                Callback->setRewriter(TheRewriter);
                 return Finder.newASTConsumer();
             }
         };
 
+        class RewriteActionFactory : public FrontendActionFactory {
+        private:
+            MatchFinder &Finder;
+            FaultInjectionCallback *Callback;
+        public:
+            RewriteActionFactory(MatchFinder &F, FaultInjectionCallback *CB) : Finder(F), Callback(CB) {}
+            std::unique_ptr<FrontendAction> create() override {
+                return std::make_unique<RewriteAction>(Finder, Callback);
+            }
+        };
+
         // Dummy Rewriter just for initialization
-        Rewriter dummy;
-        FaultInjectionCallback Callback(dummy, mutations_log);
+        FaultInjectionCallback Callback(mutations_log);
         Finder.addMatcher(CWE190Matcher, &Callback);
         Finder.addMatcher(CWE193Matcher, &Callback);
 
