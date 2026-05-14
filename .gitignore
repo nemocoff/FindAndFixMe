@@ -32,3 +32,6 @@ venv.bak/
 *.sqlite
 *.sqlite3
 *.db
+
+# Build artifacts
+core/build/

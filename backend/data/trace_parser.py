@@ -97,13 +97,17 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
     # queue 항목: AFL++가 나중에 발견한 경로일수록 희귀 (index / total)
     # crash/hang: 정의상 항상 코너 케이스 (freq = 0.001)
 
+    # 전체 개수가 적을 때는 1% 고정값이 너무 엄격하므로 최소 1개는 포함하도록 유동적 기준 적용
+    dynamic_threshold = max(CORNER_CASE_THRESHOLD, 2.0 / total if total > 0 else 0)
+
     for trace_id, source, idx in inserted:
         if source in ("afl_crash", "afl_hang"):
             exec_freq = CRASH_EXEC_FREQ
         else:
-            exec_freq = (idx + 1) / total if total > 0 else 1.0
+            # 나중에 발견된 경로(큰 idx)일수록 더 희귀함 -> (total - idx) / total 로 계산
+            exec_freq = (total - idx) / total if total > 0 else 1.0
 
-        if exec_freq < CORNER_CASE_THRESHOLD:
+        if exec_freq < dynamic_threshold:
             try:
                 db.insert_corner_case(
                     trace_id=trace_id,
@@ -113,7 +117,7 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
                 )
                 stats["corner_cases"] += 1
             except Exception:
-                # DB CHECK 제약 위반 등 예외 무시 (이미 0.01 미만만 넘어옴)
+                # DB 제약 위반 등 예외 처리
                 stats["errors"] += 1
 
     return stats

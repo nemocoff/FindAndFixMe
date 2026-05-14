@@ -86,13 +86,13 @@ class TraceDBManager:
                 )
             ''')
 
-            # 3. CornerCaseNode — exec_frequency < 0.01 강제 (T9)
+            # 3. CornerCaseNode — 유동적인 코너 케이스 탐지 지원을 위해 CHECK 제약 제거
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS CornerCaseNode (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     trace_id INTEGER NOT NULL,
                     node_type TEXT,
-                    exec_frequency REAL CHECK(exec_frequency < 0.01),
+                    exec_frequency REAL,
                     code_location TEXT,
                     FOREIGN KEY(trace_id) REFERENCES DynamicTrace(id) ON DELETE CASCADE
                 )

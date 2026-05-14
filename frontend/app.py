@@ -1,94 +1,181 @@
 import streamlit as st
+import pandas as pd
 import requests
-import time
-import os
+from api_client import (
+    upload_targets, compile_target, collect_traces, get_corner_cases, inject_mutation, 
+    upload_github_target, validate_mutant
+)
+from components.trace_tree import render_trace_tree_and_table
+from components.diff_viewer import render_diff_viewer
 
 API_BASE_URL = "http://localhost:8000/api/v1"
-
-def render_diff_viewer(old_code: str, new_code: str):
-    """GitHub 스타일의 Side-by-Side Diff 뷰어"""
-    st.markdown("##### 🔍 Code Diff Viewer")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Original Code (AS-IS)**")
-        st.code(old_code, language="cpp")
-    with col2:
-        st.markdown("**Injected Code (TO-BE)**")
-        st.code(new_code, language="cpp")
 
 def main() -> None:
     """
     FindAndFixMe C++ Migration Dashboard
     """
     st.set_page_config(page_title="FindAndFixMe Dashboard", layout="wide")
-    st.title("🐞 FindAndFixMe Dashboard (C++ Core Engine)")
+    st.title("FindAndFixMe Dashboard (C++ Core Engine)")
     
-    tab_dash, tab_hist = st.tabs(["🚀 Injection Dashboard", "📜 DB History"])
-
-    with tab_dash:
-        st.markdown("### 1. Upload Target C++ Source Code")
-        target_file = st.file_uploader("Upload Target Source (`.cpp`, `.h`)", type=["cpp", "h", "hpp", "c"])
+    import_type = st.radio("Choose Input Method", ["File Upload", "Import from Github"])
+    
+    # 패턴 매핑 (api.py의 PATTERN_REGISTRY와 동일)
+    pattern_options = {
+        0: "Auto Detect (Find any applicable pattern)",
+        1: "CWE-190 Integer Overflow",
+        2: "CWE-193 Boundary Condition Error",
+        3: "CWE-476 NULL Pointer Dereference",
+        4: "CWE-122 Heap Buffer Overflow",
+        5: "CWE-416 Use After Free",
+        6: "CWE-401 Memory Leak"
+    }
+    # 결함 주입 설정: 100% 자동 탐지 모드로 고정
+    selected_pattern_id = 0
+    
+    if "analysis_result" not in st.session_state:
+        st.session_state["analysis_result"] = None
         
-        if "analysis_result" not in st.session_state:
-            st.session_state["analysis_result"] = None
-        
-        if target_file:
-            st.info(f"File uploaded: {target_file.name}")
-            
-            if st.button("Run C++ AST Analysis & Inject Bugs", type="primary"):
-                with st.spinner("Calling Core C++ Engine via API..."):
-                    try:
-                        # Assuming API accepts file upload
-                        files = {"file": (target_file.name, target_file.getvalue())}
-                        response = requests.post(f"{API_BASE_URL}/analyze", files=files)
-                        if response.status_code == 200:
-                            st.session_state["analysis_result"] = response.json()
-                            st.success("AST Analysis & Injection complete!")
+    if import_type == "File Upload":
+        target_files = st.file_uploader("Upload Target Sources (`.cpp`, `.h`, `.hpp`, `compile_flags.txt`)", type=["cpp", "h", "hpp", "c", "txt"], accept_multiple_files=True)
+        if target_files:
+            st.info(f"{len(target_files)} file(s) uploaded.")
+            if st.button("Run Full Pipeline", type="primary"):
+                try:
+                    with st.status("Running FindAndFixMe Pipeline...", expanded=True) as status:
+                        st.write("Uploading files to server...")
+                        files_list = [(f.name, f.getvalue()) for f in target_files]
+                        res_upload = upload_targets(files_list)
+                        prog_id = res_upload["program_id"]
+                        
+                        st.write("Compiling target and extracting AST...")
+                        compile_target(prog_id)
+                        
+                        st.write("Running AFL++ Fuzzer to collect traces (5s)...")
+                        res_traces = collect_traces(prog_id, fuzz_seconds=5)
+                        
+                        st.write("Identifying Corner Cases from execution traces...")
+                        res_cc = get_corner_cases(prog_id)
+                        cc_list = res_cc.get("corner_cases", [])
+                        
+                        if not cc_list:
+                            status.update(label="Pipeline finished. No corner cases found.", state="complete", expanded=False)
+                            st.session_state["analysis_result"] = {"status": "success", "data": {"mutations": []}, "program_id": prog_id}
                         else:
-                            st.error(f"API Error: {response.text}")
-                    except Exception as e:
-                        st.error(f"Connection Error: Ensure FastAPI is running on {API_BASE_URL}. Exception: {e}")
+                            st.write(f"Found {len(cc_list)} corner cases! Injecting {pattern_options[selected_pattern_id]} Mutation...")
+                            target_node = cc_list[0]["id"]
+                            res_mut = inject_mutation(target_node, selected_pattern_id)
+                            
+                            st.session_state["analysis_result"] = {
+                                "status": "success",
+                                "program_id": prog_id,
+                                "data": {
+                                    "mutations": [{
+                                        "pattern_name": res_mut.get("pattern_name"),
+                                        "original_code": res_mut.get("original_code"), 
+                                        "mutated_code": res_mut.get("mutated_code"),
+                                        "mutant_id": res_mut.get("mutant_id")
+                                    }],
+                                    "corner_cases": cc_list,
+                                    "total_traces": res_traces.get("trace_stats", {}).get("total", 0),
+                                    "execs_done": res_traces.get("afl_stats", {}).get("execs_done", 0)
+                                }
+                            }
+                            status.update(label="Pipeline complete!", state="complete", expanded=False)
+                except requests.exceptions.HTTPError as e:
+                    err_msg = e.response.json().get("detail", str(e)) if e.response else str(e)
+                    st.error(f"Pipeline Error: {err_msg}")
+                except Exception as e:
+                    st.error(f"Pipeline Error: {e}")
+    else:
+        repo_url = st.text_input("Github Repository URL", placeholder="https://github.com/quantlib/QuantLib.git")
+        target_file = st.text_input("Target C++ File Path (Relative)", placeholder="test-suite/quantlibtestsuite.cpp")
+        
+        if repo_url and target_file:
+            if st.button("Import and Run Pipeline", type="primary"):
+                try:
+                    with st.status("Running FindAndFixMe Github Pipeline...", expanded=True) as status:
+                        st.write("Cloning repo and parsing CMake build system...")
+                        res_upload = upload_github_target(repo_url, target_file)
+                        prog_id = res_upload["program_id"]
+                        
+                        st.write("Compiling target and extracting AST (with auto-flags)...")
+                        compile_target(prog_id)
+                        
+                        st.write("Running AFL++ Fuzzer to collect traces (60s)...")
+                        res_traces = collect_traces(prog_id, fuzz_seconds=60)
+                        
+                        st.write("Identifying Corner Cases from execution traces...")
+                        res_cc = get_corner_cases(prog_id)
+                        cc_list = res_cc.get("corner_cases", [])
+                        
+                        if not cc_list:
+                            status.update(label="Pipeline finished. No corner cases found.", state="complete", expanded=False)
+                            st.session_state["analysis_result"] = {"status": "success", "data": {"mutations": []}, "program_id": prog_id}
+                        else:
+                            st.write(f"Found {len(cc_list)} corner cases! Injecting {pattern_options[selected_pattern_id]} Mutation...")
+                            target_node = cc_list[0]["id"]
+                            res_mut = inject_mutation(target_node, selected_pattern_id)
+                            
+                            st.session_state["analysis_result"] = {
+                                "status": "success",
+                                "program_id": prog_id,
+                                "data": {
+                                    "mutations": [{
+                                        "pattern_name": res_mut.get("pattern_name"),
+                                        "original_code": res_mut.get("original_code"), 
+                                        "mutated_code": res_mut.get("mutated_code"),
+                                        "mutant_id": res_mut.get("mutant_id")
+                                    }],
+                                    "corner_cases": cc_list,
+                                    "total_traces": res_traces.get("trace_stats", {}).get("total", 0),
+                                    "execs_done": res_traces.get("afl_stats", {}).get("execs_done", 0)
+                                }
+                            }
+                            status.update(label="Github Pipeline complete!", state="complete", expanded=False)
+                except requests.exceptions.HTTPError as e:
+                    err_msg = e.response.json().get("detail", str(e)) if e.response else str(e)
+                    st.error(f"Github Pipeline Error: {err_msg}")
+                except Exception as e:
+                    st.error(f"Github Pipeline Error: {e}")
 
-        if st.session_state["analysis_result"] and st.session_state["analysis_result"].get("status") == "success":
-            st.markdown("---")
-            st.markdown("### 2. Analysis Results & Diff Viewer")
-            
-            # Example response structure from Core C++ Engine
-            mutations = st.session_state["analysis_result"].get("data", {}).get("mutations", [])
-            
-            if not mutations:
-                st.warning("No mutations could be applied by the C++ engine.")
-                # Mock display for presentation purposes if empty
-                st.info("Mocking diff viewer for demonstration purposes:")
-                render_diff_viewer(
-                    "int main() {\n    int a = 10;\n    return 0;\n}",
-                    "int main() {\n    // CWE-190 Integer Overflow\n    int a = 2147483647 + 1;\n    return 0;\n}"
-                )
-            else:
-                for idx, mut in enumerate(mutations):
-                    st.markdown(f"#### Mutation {idx+1}: {mut.get('pattern_name', 'Unknown')}")
-                    render_diff_viewer(mut.get('original_code', ''), mut.get('mutated_code', ''))
-                    
-            st.markdown("---")
-            st.markdown("### 3. Verification Pipeline")
-            col_afl, col_gemini = st.columns(2)
-            with col_afl:
-                if st.button("Trigger AFL++ Fuzzer"):
-                    st.info("AFL++ Fuzzing initiated. Check backend logs.")
-            with col_gemini:
-                if st.button("Trigger Gemini API Verification"):
-                    st.info("Gemini API Verification initiated.")
-
-    with tab_hist:
-        st.markdown("### Injection History")
-        if st.button("Refresh History"):
-            try:
-                response = requests.get(f"{API_BASE_URL}/history")
-                if response.status_code == 200:
-                    st.json(response.json())
-            except Exception as e:
-                st.error("Could not fetch history from API.")
+    if st.session_state["analysis_result"] and st.session_state["analysis_result"].get("status") == "success":
+        st.markdown("---")
+        
+        # 코너케이스 정보가 있으면 트리와 함께 표시
+        cc_data = st.session_state["analysis_result"].get("data", {}).get("corner_cases", [])
+        total_traces = st.session_state["analysis_result"].get("data", {}).get("total_traces", 0)
+        execs_done = st.session_state["analysis_result"].get("data", {}).get("execs_done", 0)
+        
+        if cc_data:
+            render_trace_tree_and_table(cc_data, total_traces, execs_done)
+        
+        st.markdown("---")
+        st.markdown("### 2. Mutation Analysis & Diff Viewer")
+        
+        mutations = st.session_state["analysis_result"].get("data", {}).get("mutations", [])
+        
+        if not mutations:
+            st.warning("No mutations were applied.")
+        else:
+            for idx, mut in enumerate(mutations):
+                st.markdown(f"#### Mutation {idx+1}: {mut.get('pattern_name', 'Unknown Pattern')}")
+                render_diff_viewer(mut.get('original_code', ''), mut.get('mutated_code', ''))
+                
+                if st.button(f"Validate Mutant {mut.get('mutant_id')}", key=f"val_{idx}"):
+                    with st.spinner("Starting validation pipeline..."):
+                        try:
+                            val_res = validate_mutant(mut.get('mutant_id'))
+                            st.info(val_res.get("message"))
+                        except Exception as e:
+                            st.error(f"Validation Error: {e}")
+                
+        st.markdown("---")
+        st.markdown("### 3. Verification Tools")
+        col_afl, col_gemini = st.columns(2)
+        with col_afl:
+            st.button("Trigger AFL++ Fuzzer (Manual)", help="Manual re-run of AFL++")
+        with col_gemini:
+            st.button("Trigger Gemini API Verification (Manual)", help="Run LLM analysis on mutants")
 
 if __name__ == "__main__":
     main()
-

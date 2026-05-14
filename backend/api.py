@@ -60,6 +60,10 @@ class MutationInjectRequest(BaseModel):
     node_id: int
     pattern_id: int
 
+class GithubTargetRequest(BaseModel):
+    repo_url: str
+    target_file: str # 저장소 내 상대 경로 (예: fuzz-test-suite/date.cpp)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 내부 헬퍼
@@ -73,30 +77,81 @@ def _run_subprocess(cmd: list, timeout: int = 60, env: dict = None) -> subproces
 
 
 def _compile_regular(source_path: str, binary_path: str) -> str:
-    """[T3-a] clang++-16으로 일반 바이너리 컴파일. 실패 시 stderr 반환."""
-    result = _run_subprocess(["clang++-16", "-std=c++17", "-o", binary_path, source_path], timeout=60)
+    """[T3-a] clang++-16으로 일반 바이너리 컴파일. source_path가 공백 포함 시 리스트로 처리."""
+    prog_dir = os.path.dirname(source_path)
+    all_sources = [os.path.join(prog_dir, f) for f in os.listdir(prog_dir) if f.endswith((".cpp", ".cc", ".cxx"))]
+    
+    extra_flags = []
+    # LibFuzzer 하네스 자동 감지
+    for src in all_sources:
+        try:
+            with open(src, "r", encoding="utf-8") as f:
+                if "LLVMFuzzerTestOneInput" in f.read():
+                    extra_flags.append("-fsanitize=fuzzer")
+                    break
+        except Exception:
+            pass
+
+    # 커스텀 컴파일 플래그 파일 읽기
+    flags_file = os.path.join(prog_dir, "compile_flags.txt")
+    if os.path.exists(flags_file):
+        with open(flags_file, "r", encoding="utf-8") as f:
+            for line in f:
+                flag = line.strip()
+                if flag and not flag.startswith("#"):
+                    extra_flags.append(flag)
+
+    cmd = ["clang++-16", "-std=c++17", "-I", prog_dir, "-o", binary_path] + extra_flags + all_sources
+    result = _run_subprocess(cmd, timeout=60)
     return result.stderr if result.returncode != 0 else ""
 
 
 def _compile_afl(source_path: str, afl_binary_path: str) -> str:
     """[T3-b] afl-clang++로 계측(instrumented) 바이너리 컴파일."""
-    afl_compiler = shutil.which("afl-clang++") or shutil.which("afl-clang++-16")
+    afl_compiler = shutil.which("afl-clang-fast++") or shutil.which("afl-clang++-16") or shutil.which("afl-clang++")
     if not afl_compiler:
-        return "afl-clang++ not found — skipping AFL instrumentation build."
-    result = _run_subprocess([afl_compiler, "-std=c++17", "-o", afl_binary_path, source_path], timeout=60)
+        return "afl-clang-fast++ not found — skipping AFL instrumentation build."
+
+    prog_dir = os.path.dirname(source_path)
+    all_sources = [os.path.join(prog_dir, f) for f in os.listdir(prog_dir) if f.endswith((".cpp", ".cc", ".cxx"))]
+
+    extra_flags = []
+    # LibFuzzer 하네스 자동 감지
+    for src in all_sources:
+        try:
+            with open(src, "r", encoding="utf-8") as f:
+                if "LLVMFuzzerTestOneInput" in f.read():
+                    extra_flags.append("-fsanitize=fuzzer")
+                    break
+        except Exception:
+            pass
+
+    # 커스텀 컴파일 플래그 파일 읽기
+    flags_file = os.path.join(prog_dir, "compile_flags.txt")
+    if os.path.exists(flags_file):
+        with open(flags_file, "r", encoding="utf-8") as f:
+            for line in f:
+                flag = line.strip()
+                if flag and not flag.startswith("#"):
+                    extra_flags.append(flag)
+
+    cmd = [afl_compiler, "-std=c++17", "-I", prog_dir, "-o", afl_binary_path] + extra_flags + all_sources
+    result = _run_subprocess(cmd, timeout=60)
     return result.stderr if result.returncode != 0 else ""
 
 
-def _run_afl_docker(program_id: int, afl_binary_name: str,
+def _run_afl_docker(program_id: int, afl_binary_path: str,
                     afl_out_dir: str, timeout_sec: int = 60) -> bool:
     """
     [T1, T4] AFL++ 퍼저 실행.
-    모든 경로를 절대경로로 처리하여 작업 디렉토리 의존성 제거.
+    afl_binary_path는 DB에서 직접 받은 절대경로를 사용 (숫자 ID 기반 재조합 없음).
     """
-    # 절대경로로 통일
-    afl_out_dir = os.path.abspath(afl_out_dir)
-    targets_abs = os.path.abspath(TEMP_TARGETS_DIR)
-    binary_path = os.path.join(targets_abs, afl_binary_name)
+    afl_out_dir  = os.path.abspath(afl_out_dir)
+    binary_path  = os.path.abspath(afl_binary_path)
+
+    if not os.path.isfile(binary_path):
+        print(f"[AFL++] Binary not found: {binary_path}")
+        return False
 
     # 씨드 디렉토리: 출력 디렉토리 바깥에 위치 (AFL++ 요구사항)
     seed_dir = os.path.abspath(os.path.join(AFL_OUTPUT_BASE, f"seeds_{program_id}"))
@@ -130,7 +185,8 @@ def _run_afl_docker(program_id: int, afl_binary_name: str,
 
     if result.returncode not in (0, 124):  # 124 = timeout 정상 종료
         print(f"[AFL++] FAILED (code={result.returncode}):\n"
-              f"{result.stderr.decode(errors='ignore')[-800:]}")
+              f"STDOUT: {result.stdout.decode(errors='ignore')[-800:]}\n"
+              f"STDERR: {result.stderr.decode(errors='ignore')[-800:]}")
 
     return True
 
@@ -140,32 +196,152 @@ def _run_afl_docker(program_id: int, afl_binary_name: str,
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/v1/target")
-async def init_target(file: UploadFile = File(...)):
-    """[T2] C++ 소스 파일 업로드 → 서버 저장 → program_id 발급 (HTTP 200 OK)."""
-    if not file.filename.endswith((".cpp", ".cc", ".cxx")):
-        raise HTTPException(status_code=400, detail="C++ 소스 파일(.cpp/.cc/.cxx)만 허용됩니다.")
-
+async def init_target(files: list[UploadFile] = File(...)):
+    """[T2] 여러 소스/헤더 파일 업로드 → 전용 디렉토리 저장 → program_id 발급."""
     try:
-        content = await file.read()
-        os.makedirs(TEMP_TARGETS_DIR, exist_ok=True)
-        safe_name = os.path.basename(file.filename)
-        file_path = os.path.join(TEMP_TARGETS_DIR, safe_name)
-        with open(file_path, "wb") as f:
-            f.write(content)
-
+        # 1. DB에 먼저 레코드 생성하여 ID 발급
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO TargetProgram (file_path, original_code) VALUES (?, ?)",
-                (file_path, content.decode("utf-8", errors="ignore"))
+                ("pending", "multiple_files")
             )
             program_id = cursor.lastrowid
             conn.commit()
 
-        return {"status": "success", "program_id": program_id, "file": safe_name}
+        # 2. ID별 전용 디렉토리 생성
+        prog_dir = os.path.join(TEMP_TARGETS_DIR, str(program_id))
+        os.makedirs(prog_dir, exist_ok=True)
+        
+        primary_file_path = ""
+        for file in files:
+            safe_name = os.path.basename(file.filename)
+            file_path = os.path.join(prog_dir, safe_name)
+            content = await file.read()
+            with open(file_path, "wb") as f:
+                f.write(content)
+            # 첫 번째 .cpp 파일을 메인 타겟으로 설정
+            if not primary_file_path and safe_name.endswith((".cpp", ".cc", ".cxx")):
+                primary_file_path = file_path
+
+        # 3. 대표 파일 경로 업데이트
+        with get_db_connection() as conn:
+            conn.execute(
+                "UPDATE TargetProgram SET file_path=? WHERE id=?",
+                (primary_file_path or os.path.join(prog_dir, files[0].filename), program_id)
+            )
+            conn.commit()
+
+        return {"status": "success", "program_id": program_id, "files": [f.filename for f in files]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.post("/api/v1/target/github")
+async def init_target_github(req: GithubTargetRequest):
+    """[T2-Git] Github 저장소 클론 → CMake 분석 → compile_flags.txt 자동 생성."""
+    try:
+        # 1. DB 레코드 생성
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO TargetProgram (file_path, original_code) VALUES (?, ?)",
+                ("pending", "github_import")
+            )
+            program_id = cursor.lastrowid
+            conn.commit()
+
+        # 프로젝트명_연월일시분 형식으로 디렉터리 이름 결정
+        from datetime import datetime
+        repo_name_raw = req.repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+        date_str = datetime.now().strftime("%Y%m%d%H%M")
+        project_dir_name = f"{repo_name_raw}_{date_str}"
+        prog_dir = os.path.join(TEMP_TARGETS_DIR, project_dir_name)
+        # 같은 날 여러번 클론 시 번호 suffix 추가
+        suffix = 1
+        base_prog_dir = prog_dir
+        while os.path.exists(prog_dir):
+            prog_dir = f"{base_prog_dir}_{suffix}"
+            suffix += 1
+        os.makedirs(prog_dir, exist_ok=True)
+        repo_dir = os.path.join(prog_dir, "repo")
+
+        # 2. Git Clone
+        print(f"[Git] Cloning {req.repo_url}...")
+        _run_subprocess(["git", "clone", "--depth", "1", req.repo_url, repo_dir], timeout=120)
+
+        # 3. CMake 실행 및 compile_commands.json 생성
+        build_dir = os.path.join(repo_dir, "build")
+        os.makedirs(build_dir, exist_ok=True)
+        print(f"[CMake] Configuring {req.repo_url}...")
+        _run_subprocess(["cmake", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", ".."], timeout=120, env={"PWD": build_dir})
+
+        # 4. JSON 파싱 및 플래그 추출
+        flags = []
+        cc_json = os.path.join(build_dir, "compile_commands.json")
+        target_abs = os.path.abspath(os.path.join(repo_dir, req.target_file))
+        
+        if os.path.exists(cc_json):
+            with open(cc_json, "r") as f:
+                commands = json.load(f)
+                for entry in commands:
+                    if req.target_file in entry.get("file", ""):
+                        # 명령어 분리 후 -I, -D 등 주요 플래그 추출
+                        parts = entry.get("command", "").split()
+                        for i, part in enumerate(parts):
+                            if part.startswith("-I") or part.startswith("-D") or part.startswith("-std"):
+                                flags.append(part)
+                            # -I 뒤에 띄어쓰기로 경로가 오는 경우
+                            elif part == "-I" and i + 1 < len(parts):
+                                flags.append(f"-I{parts[i+1]}")
+                        break
+        
+        # 휴리스틱: 저장소 이름으로 링커 옵션 추론 (예: quantlib -> -lQuantLib)
+        repo_name = req.repo_url.split("/")[-1].replace(".git", "").lower()
+        if "quantlib" in repo_name:
+            flags.append("-lQuantLib")
+        elif "openssl" in repo_name:
+            flags.append("-lssl")
+            flags.append("-lcrypto")
+
+        # 5. compile_flags.txt 저장
+        flags_file = os.path.join(prog_dir, "compile_flags.txt")
+        with open(flags_file, "w") as f:
+            for flag in set(flags): # 중복 제거
+                f.write(f"{flag}\n")
+
+        # 대상 파일을 prog_dir로 복사 (파이프라인 일관성 유지)
+        safe_name = os.path.basename(target_abs)
+        file_path = os.path.join(prog_dir, safe_name)
+        if os.path.exists(target_abs):
+            shutil.copy(target_abs, file_path)
+        else:
+            raise Exception(f"Target file {req.target_file} not found in repository.")
+
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            actual_code = f.read()
+
+        with get_db_connection() as conn:
+            conn.execute(
+                "UPDATE TargetProgram SET file_path=?, original_code=? WHERE id=?",
+                # source_file_path: 레포 내 원본 위치 (결함 주입 후 덮어쓰기에 사용)
+                (file_path, actual_code, program_id)
+            )
+            # 레포 내 원본 절대경로를 별도 컬럼에 저장 (없으면 그냥 동일 경로 사용)
+            try:
+                conn.execute(
+                    "ALTER TABLE TargetProgram ADD COLUMN source_file_path TEXT"
+                )
+            except Exception:
+                pass  # 이미 컬럼이 있으면 무시
+            conn.execute(
+                "UPDATE TargetProgram SET source_file_path=? WHERE id=?",
+                (target_abs, program_id)
+            )
+            conn.commit()
+
+        return {"status": "success", "program_id": program_id, "flags_extracted": len(flags)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Github Import Failed: {str(e)}")
 
 @app.post("/api/v1/target/{program_id}/compile")
 async def compile_target(program_id: int):
@@ -175,15 +351,22 @@ async def compile_target(program_id: int):
         raise HTTPException(status_code=404, detail="Program not found.")
 
     source_path = program["file_path"]
+    prog_dir = os.path.dirname(source_path)
     base = source_path.rsplit(".", 1)[0]
     binary_path = base + "_bin"
     afl_binary_path = base + "_afl"
+
+    # 해당 디렉토리의 모든 .cpp 파일을 컴파일 대상으로 포함
+    all_sources = [os.path.join(prog_dir, f) for f in os.listdir(prog_dir) 
+                   if f.endswith((".cpp", ".cc", ".cxx"))]
+    source_cmd_part = " ".join(all_sources)
 
     errors = {}
 
     # [T3-a] 일반 컴파일
     err = _compile_regular(source_path, binary_path)
     if err:
+        print(f"[ERROR] Regular Compilation Failed:\n{err}") # 에러 로그 추가
         errors["clang_error"] = err
         raise HTTPException(status_code=400, detail=errors)
 
@@ -229,8 +412,8 @@ async def collect_traces(program_id: int, fuzz_seconds: int = 60):
     afl_binary_name = os.path.basename(afl_binary_path)
     afl_out_dir = os.path.join(AFL_OUTPUT_BASE, str(program_id))
 
-    # [T4] AFL++ 실행 (Docker 또는 호스트)
-    success = _run_afl_docker(program_id, afl_binary_name, afl_out_dir, timeout_sec=fuzz_seconds)
+    # [T4] AFL++ 실행 (호스트 직접 실행, 절대경로 전달)
+    success = _run_afl_docker(program_id, afl_binary_path, afl_out_dir, timeout_sec=fuzz_seconds)
 
     # [T6, T9] 출력 파싱 → DB 적재
     stats = parse_afl_output(afl_out_dir, program_id, db)
@@ -252,7 +435,7 @@ async def get_corner_cases(program_id: int):
             rows = conn.execute('''
                 SELECT c.* FROM CornerCaseNode c
                 JOIN DynamicTrace d ON c.trace_id = d.id
-                WHERE d.program_id = ? AND c.exec_frequency < 0.01
+                WHERE d.program_id = ?
             ''', (program_id,)).fetchall()
             return {"status": "success", "corner_cases": [dict(r) for r in rows]}
         except Exception as e:
@@ -282,8 +465,8 @@ async def inject_mutation(req: MutationInjectRequest):
     [T10, T11] MutationEngine 바이너리를 subprocess로 호출하여
     결함을 주입하고, 변조 코드를 재컴파일한다.
     """
-    if req.pattern_id not in PATTERN_REGISTRY:
-        raise HTTPException(status_code=400, detail=f"pattern_id는 1~6 사이여야 합니다.")
+    if req.pattern_id != 0 and req.pattern_id not in PATTERN_REGISTRY:
+        raise HTTPException(status_code=400, detail=f"pattern_id는 0(Auto Detect) 또는 1~6 사이여야 합니다.")
 
     # node_id → program_id 조회 (CornerCaseNode 경유)
     # actual_node_id: FK에 쓸 실제 CornerCaseNode.id (없으면 None)
@@ -292,7 +475,8 @@ async def inject_mutation(req: MutationInjectRequest):
     try:
         with get_db_connection() as conn:
             row = conn.execute(
-                """SELECT t.id as program_id, t.file_path, t.original_code
+                """SELECT t.id as program_id, t.file_path, t.original_code,
+                          t.source_file_path
                    FROM TargetProgram t
                    JOIN DynamicTrace d ON d.program_id = t.id
                    JOIN CornerCaseNode c ON c.trace_id = d.id
@@ -309,7 +493,7 @@ async def inject_mutation(req: MutationInjectRequest):
         try:
             with get_db_connection() as conn:
                 row = conn.execute(
-                    "SELECT id as program_id, file_path, original_code FROM TargetProgram WHERE id=?",
+                    "SELECT id as program_id, file_path, original_code, source_file_path FROM TargetProgram WHERE id=?",
                     (req.node_id,)
                 ).fetchone()
             # fallback이므로 actual_node_id = None (FK 위반 방지)
@@ -319,9 +503,14 @@ async def inject_mutation(req: MutationInjectRequest):
     if not row:
         raise HTTPException(status_code=404, detail="해당 node_id에 연결된 프로그램을 찾을 수 없습니다.")
 
-    program_id = row["program_id"]
-    source_path = row["file_path"]
+    program_id   = row["program_id"]
+    source_path  = row["file_path"]
     original_code = row["original_code"]
+    # 레포 내 원본 절대경로 (없으면 복사본 경로로 대체)
+    try:
+        source_file_path = row["source_file_path"] or source_path
+    except Exception:
+        source_file_path = source_path
 
     # [T11-a] MutationEngine subprocess 호출
     if not os.path.exists(MUTATION_ENGINE_BIN):
@@ -330,49 +519,65 @@ async def inject_mutation(req: MutationInjectRequest):
             detail=f"MutationEngine 바이너리가 없습니다: {MUTATION_ENGINE_BIN}\ncore/를 먼저 빌드해주세요."
         )
 
-    try:
-        engine_result = _run_subprocess(
-            [MUTATION_ENGINE_BIN,
-             source_path,
-             f"--pattern-id={req.pattern_id}",
-             "--"],
-            timeout=30
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="MutationEngine 실행 타임아웃 (30초)")
-    except FileNotFoundError:
-        raise HTTPException(status_code=503, detail="MutationEngine 바이너리를 실행할 수 없습니다.")
+    patterns_to_try = [req.pattern_id] if req.pattern_id != 0 else list(PATTERN_REGISTRY.keys())
+    successful_pattern_id = None
+    mutated_code = ""
+    mutations = []
 
-    if engine_result.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=f"MutationEngine 오류:\n{engine_result.stderr}"
-        )
+    for pid in patterns_to_try:
+        try:
+            engine_result = _run_subprocess(
+                [MUTATION_ENGINE_BIN,
+                 source_path,
+                 f"--pattern-id={pid}",
+                 "--"],
+                timeout=30
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        except FileNotFoundError:
+            raise HTTPException(status_code=503, detail="MutationEngine 바이너리를 실행할 수 없습니다.")
 
-    try:
-        output = json.loads(engine_result.stdout)
-        mutated_code = output.get("mutated_code", "")
-        mutations = output.get("mutations", [])
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="MutationEngine 출력 JSON 파싱 실패")
+        if engine_result.returncode != 0:
+            continue
 
-    if not mutated_code or mutated_code.strip() == original_code.strip():
+        try:
+            output = json.loads(engine_result.stdout)
+            m_code = output.get("mutated_code", "")
+            m_list = output.get("mutations", [])
+            
+            if m_code and m_code.strip() != original_code.strip():
+                successful_pattern_id = pid
+                mutated_code = m_code
+                mutations = m_list
+                req.pattern_id = pid  # 성공한 패턴 ID로 갱신
+                break
+        except json.JSONDecodeError:
+            continue
+
+    if not successful_pattern_id:
         raise HTTPException(
             status_code=400,
-            detail="Integrity Rule 1: 변조 코드가 원본과 동일합니다. 해당 패턴이 소스에서 발견되지 않았을 수 있습니다."
+            detail="AST 매칭 실패: 해당 타겟 코드에서 주입 가능한 어떠한 취약점 패턴도 발견하지 못했습니다."
         )
 
-    # [T11-b] 변조 코드 임시 파일 저장 + 재컴파일
+    # [T11-b] 결함 주입된 코드를 의미 있는 파일명으로 저장 + 재컴파일
     mutant_binary_path = ""
-    with tempfile.NamedTemporaryFile(
-        suffix=".cpp", dir=TEMP_TARGETS_DIR,
-        delete=False, mode="w", encoding="utf-8"
-    ) as tmp:
-        tmp.write(mutated_code)
-        tmp_src = tmp.name
+    orig_basename = os.path.splitext(os.path.basename(source_path))[0]
+    mutant_src = os.path.join(os.path.dirname(source_path), f"{orig_basename}_mutant.cpp")
+
+    with open(mutant_src, "w", encoding="utf-8") as f:
+        f.write(mutated_code)
+    tmp_src = mutant_src
+
+    # ── 레포 내 원본 파일 위치에도 결함 코드 덮어쓰기 ────────────────────
+    if source_file_path and os.path.exists(os.path.dirname(source_file_path)):
+        with open(source_file_path, "w", encoding="utf-8") as f:
+            f.write(mutated_code)
+        print(f"[Inject] Mutated code written back to original location: {source_file_path}")
 
     try:
-        mutant_bin = tmp_src.replace(".cpp", "_mutant")
+        mutant_bin = tmp_src.replace(".cpp", "")
         recompile_err = _compile_regular(tmp_src, mutant_bin)
         if not recompile_err:
             mutant_binary_path = mutant_bin
@@ -400,6 +605,7 @@ async def inject_mutation(req: MutationInjectRequest):
         "pattern_name": PATTERN_REGISTRY[req.pattern_id],
         "mutations_applied": mutations,
         "mutant_binary_path": mutant_binary_path or "재컴파일 실패",
+        "original_code": original_code,
         "mutated_code": mutated_code,
     }
 
@@ -499,3 +705,4 @@ async def generate_report(mutant_id: int):
         return Response(content=pdf_content, media_type="application/pdf")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
