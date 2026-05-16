@@ -22,7 +22,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from .data.db_manager import TraceDBManager, get_db_connection, DB_PATH
-from .data.trace_parser import parse_afl_output, export_traces_as_json, read_afl_stats
+from .data.trace_parser import parse_afl_output, export_traces_as_json, read_afl_stats, build_trace_tree
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 앱 초기화
@@ -440,6 +440,19 @@ async def get_corner_cases(program_id: int):
             return {"status": "success", "corner_cases": [dict(r) for r in rows]}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"DB Error: {str(e)}")
+
+
+@app.get("/api/v1/target/{program_id}/tree-map")
+async def get_trace_tree(program_id: int):
+    """
+    [T13] 트리맵 시각화용 데이터 반환.
+    hit_count에 따른 색상 구분 및 코너케이스 강조 데이터를 포함함.
+    """
+    try:
+        tree_data = build_trace_tree(program_id, db)
+        return {"status": "success", "tree_data": tree_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Tree generation failed: {str(e)}")
 
 
 @app.post("/api/v1/smt/solve")
