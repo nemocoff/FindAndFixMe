@@ -3,7 +3,7 @@ import pandas as pd
 import requests
 from api_client import (
     upload_targets, compile_target, collect_traces, get_corner_cases, inject_mutation, 
-    upload_github_target, validate_mutant
+    upload_github_target, validate_mutant, get_trace_tree
 )
 from components.trace_tree import render_trace_tree_and_table
 from components.diff_viewer import render_diff_viewer
@@ -57,6 +57,10 @@ def main() -> None:
                         res_cc = get_corner_cases(prog_id)
                         cc_list = res_cc.get("corner_cases", [])
                         
+                        st.write("Generating Dynamic Execution Tree...")
+                        res_tree = get_trace_tree(prog_id)
+                        tree_data = res_tree.get("tree_data")
+                        
                         if not cc_list:
                             status.update(label="Pipeline finished. No corner cases found.", state="complete", expanded=False)
                             st.session_state["analysis_result"] = {"status": "success", "data": {"mutations": []}, "program_id": prog_id}
@@ -76,6 +80,7 @@ def main() -> None:
                                         "mutant_id": res_mut.get("mutant_id")
                                     }],
                                     "corner_cases": cc_list,
+                                    "tree_data": tree_data,
                                     "total_traces": res_traces.get("trace_stats", {}).get("total", 0),
                                     "execs_done": res_traces.get("afl_stats", {}).get("execs_done", 0)
                                 }
@@ -88,7 +93,7 @@ def main() -> None:
                     st.error(f"Pipeline Error: {e}")
     else:
         repo_url = st.text_input("Github Repository URL", placeholder="https://github.com/quantlib/QuantLib.git")
-        target_file = st.text_input("Target C++ File Path (Relative)", placeholder="test-suite/quantlibtestsuite.cpp")
+        target_file = st.text_input("Target C++ File Path (Relative)", placeholder="fuzz-test-suite/quantlibtestsuite.cpp")
         
         if repo_url and target_file:
             if st.button("Import and Run Pipeline", type="primary"):
@@ -108,6 +113,10 @@ def main() -> None:
                         res_cc = get_corner_cases(prog_id)
                         cc_list = res_cc.get("corner_cases", [])
                         
+                        st.write("Generating Dynamic Execution Tree...")
+                        res_tree = get_trace_tree(prog_id)
+                        tree_data = res_tree.get("tree_data")
+                        
                         if not cc_list:
                             status.update(label="Pipeline finished. No corner cases found.", state="complete", expanded=False)
                             st.session_state["analysis_result"] = {"status": "success", "data": {"mutations": []}, "program_id": prog_id}
@@ -127,6 +136,7 @@ def main() -> None:
                                         "mutant_id": res_mut.get("mutant_id")
                                     }],
                                     "corner_cases": cc_list,
+                                    "tree_data": tree_data,
                                     "total_traces": res_traces.get("trace_stats", {}).get("total", 0),
                                     "execs_done": res_traces.get("afl_stats", {}).get("execs_done", 0)
                                 }
@@ -143,11 +153,12 @@ def main() -> None:
         
         # 코너케이스 정보가 있으면 트리와 함께 표시
         cc_data = st.session_state["analysis_result"].get("data", {}).get("corner_cases", [])
+        tree_data = st.session_state["analysis_result"].get("data", {}).get("tree_data")
         total_traces = st.session_state["analysis_result"].get("data", {}).get("total_traces", 0)
         execs_done = st.session_state["analysis_result"].get("data", {}).get("execs_done", 0)
         
-        if cc_data:
-            render_trace_tree_and_table(cc_data, total_traces, execs_done)
+        if tree_data:
+            render_trace_tree_and_table(tree_data, cc_data, total_traces, execs_done)
         
         st.markdown("---")
         st.markdown("### 2. Mutation Analysis & Diff Viewer")

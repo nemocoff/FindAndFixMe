@@ -3,137 +3,129 @@ import pandas as pd
 from streamlit_echarts import st_echarts
 
 
-def _build_tree_data(cc_data: list) -> dict:
+def _process_node(node: dict, max_hits: int) -> dict:
     """
-    실제 cc_data(CornerCaseNode 목록)를 ECharts Tree 형태로 변환.
-    node_type에 따라 색상을 다르게 표시.
+    재귀적으로 노드를 처리하며 ECharts 스타일 적용.
+    - 코너케이스: 빨간색
+    - 일반노드: hit_count에 따른 파란색 농도 조절
     """
-    # 루트 노드
-    root = {
-        "name": "Target Program\n(Entry Point)",
-        "itemStyle": {"color": "#4a9eff"},
-        "children": []
+    is_cc = node.get("is_corner_case", False)
+    hits = node.get("hit_count", 0)
+    
+    # 색상 결정 로직
+    if is_cc:
+        color = "#ff4b4b" # 빨간색
+    else:
+        # 방문 횟수에 따른 파란색 농도 (0.2 ~ 1.0)
+        opacity = max(0.2, min(1.0, hits / max_hits)) if max_hits > 0 else 0.5
+        color = f"rgba(74, 158, 255, {opacity})"
+    
+    # 툴팁 내용 구성 (코너케이스일 경우 코드 포함)
+    name = node.get("name", "node")
+    snippet = node.get("code_snippet", "")
+    tooltip_text = f"<b>Location:</b> {name}<br/><b>Hits:</b> {hits}"
+    if snippet:
+        # HTML 엔티티 처리 및 줄바꿈 적용
+        safe_snippet = snippet.replace("\n", "<br/>").replace(" ", "&nbsp;")
+        tooltip_text += f"<br/><hr/><b>Code Trace:</b><br/><code style='font-family:monospace; font-size:11px;'>{safe_snippet}</code>"
+
+    processed = {
+        "name": name,
+        "value": hits,
+        "itemStyle": {"color": color, "borderColor": color},
+        "label": {"show": True, "color": "#333"},
+        "tooltip": {"formatter": tooltip_text},
+        "children": [_process_node(c, max_hits) for c in node.get("children", [])]
     }
-
-    # 소스 타입별 색상 맵
-    color_map = {
-        "afl_crash": "#ff4b4b",
-        "afl_hang":  "#ff9800",
-        "afl_queue": "#4caf50",
-    }
-
-    for cc in cc_data:
-        node_type  = cc.get("node_type", "afl_queue")
-        node_id    = cc.get("id", "?")
-        freq       = cc.get("exec_frequency", 0)
-        location   = cc.get("code_location", "unknown")
-        color      = color_map.get(node_type, "#9c27b0")
-
-        label = f"{location}\n[{node_type}] freq={freq:.4f}"
-
-        node = {
-            "name": label,
-            "value": node_id,
-            "itemStyle": {"color": color, "borderColor": color},
-            "label": {"color": color, "fontWeight": "bold"},
-        }
-        root["children"].append(node)
-
-    return root
+    return processed
 
 
-def render_trace_tree_and_table(cc_data=None, total_traces=0, execs_done=0):
+def render_trace_tree_and_table(tree_data=None, cc_data=None, total_traces=0, execs_done=0):
     """
-    US-10: 실제 퍼징 결과 기반 노드 트리 시각화 및 코너 케이스 상세 표
+    [T13] 전체 실행 경로를 트리맵으로 시각화.
+    - 자주 방문한 곳: 파란색 그라데이션
+    - 코너 케이스: 빨간색 강조 및 코드 툴팁
     """
     execs_formatted = f"{int(execs_done):,}" if execs_done else "0"
-    st.markdown(f"### AST Execution Flow & Corner Cases (총 {total_traces}개 경로 탐색)")
+    st.markdown(f"### 🌲 Dynamic Execution Path Tree (탐색된 {total_traces}개 경로)")
 
     # ── 1. 범례 ────────────────────────────────────────────────────────────────
     legend_html = """
-    <div style="display:flex;gap:18px;margin-bottom:8px;font-size:13px;">
-        <span><span style="color:#ff4b4b;font-size:18px;">●</span> Crash</span>
-        <span><span style="color:#ff9800;font-size:18px;">●</span> Hang</span>
-        <span><span style="color:#4caf50;font-size:18px;">●</span> Queue (희귀 경로)</span>
-        <span><span style="color:#4a9eff;font-size:18px;">●</span> Entry</span>
+    <div style="display:flex;gap:18px;margin-bottom:12px;font-size:13px;align-items:center;">
+        <div style="display:flex;align-items:center;"><span style="display:inline-block;width:12px;height:12px;background:#ff4b4b;margin-right:5px;border-radius:2px;"></span><b>Corner Case</b> (Red)</div>
+        <div style="display:flex;align-items:center;"><span style="display:inline-block;width:12px;height:12px;background:#4a9eff;margin-right:5px;border-radius:2px;"></span><b>Frequent Path</b> (Deep Blue)</div>
+        <div style="display:flex;align-items:center;"><span style="display:inline-block;width:12px;height:12px;background:rgba(74,158,255,0.3);margin-right:5px;border-radius:2px;"></span><b>Rare Path</b> (Light Blue)</div>
     </div>
     """
     st.markdown(legend_html, unsafe_allow_html=True)
 
     # ── 2. ECharts Tree 렌더링 ─────────────────────────────────────────────────
-    if cc_data:
-        trace_data = _build_tree_data(cc_data)
+    if tree_data and tree_data.get("children"):
+        max_hits = tree_data.get("hit_count", 1)
+        formatted_data = _process_node(tree_data, max_hits)
     else:
-        # 데이터가 없을 때 보여줄 안내 목업
-        trace_data = {
-            "name": "Target Program\n(Entry Point)",
-            "itemStyle": {"color": "#4a9eff"},
-            "children": [
-                {"name": "No corner cases detected\n(Run pipeline first)", "itemStyle": {"color": "#aaaaaa"}}
-            ]
+        formatted_data = {
+            "name": "No Execution Data",
+            "itemStyle": {"color": "#ccc"},
+            "children": []
         }
 
     options = {
         "tooltip": {
             "trigger": "item",
             "triggerOn": "mousemove",
-            "formatter": "{b}"
+            "enterable": True, # 툴팁 안의 텍스트 드래그 가능하게
+            "backgroundColor": "rgba(255, 255, 255, 0.95)",
+            "extraCssText": "box-shadow: 0 0 8px rgba(0,0,0,0.3); border-radius: 4px; padding: 10px; max-width: 400px; white-space: normal;"
         },
         "series": [
             {
                 "type": "tree",
-                "data": [trace_data],
+                "data": [formatted_data],
                 "top": "5%",
-                "left": "15%",
+                "left": "10%",
                 "bottom": "5%",
-                "right": "25%",
-                "symbolSize": 14,
+                "right": "20%",
+                "symbol": "circle",
+                "symbolSize": 18,
+                "orient": "LR", # Left to Right
                 "label": {
-                    "position": "left",
+                    "position": "top",
+                    "rotate": 0,
                     "verticalAlign": "middle",
-                    "align": "right",
-                    "fontSize": 12,
-                    "fontFamily": "monospace"
+                    "align": "middle",
+                    "fontSize": 11
                 },
                 "leaves": {
                     "label": {
                         "position": "right",
-                        "verticalAlign": "middle",
                         "align": "left"
                     }
                 },
-                "emphasis": {"focus": "descendant"},
                 "expandAndCollapse": True,
-                "animationDuration": 550,
-                "animationDurationUpdate": 750,
-                "initialTreeDepth": 3
+                "initialTreeDepth": 2,
+                "lineStyle": {"width": 2, "curveness": 0.5}
             }
         ]
     }
 
-    st_echarts(options=options, height="450px")
+    st_echarts(options=options, height="500px")
 
-    # ── 3. 상세 테이블 ─────────────────────────────────────────────────────────
-    st.markdown("#### 탐지된 코너 케이스")
-
+    # ── 3. 상세 테이블 (기존 기능 유지) ─────────────────────────────────────────
     if cc_data:
+        st.markdown("#### 🚩 탐지된 코너 케이스 상세 리스트")
         df_rows = []
         for cc in cc_data:
             df_rows.append({
-                "ID":        cc.get("id"),
+                "ID":        str(cc.get("id")),
                 "Type":      cc.get("node_type", "-"),
                 "Location":  cc.get("code_location", "-"),
                 "Frequency": f"{cc.get('exec_frequency', 0):.4f}",
             })
         df_corner_cases = pd.DataFrame(df_rows)
-        count = len(cc_data)
-    else:
-        df_corner_cases = pd.DataFrame([])
-        count = 0
+        st.dataframe(df_corner_cases, width="stretch", hide_index=True)
 
-    st.error(
-        f"60초 동안 퍼저가 코드를 **{execs_formatted}번** 실행하여 "
-        f"총 **{total_traces}**개의 고유 경로를 탐색했으며, "
-        f"그중 도달률이 가장 낮은 코너 케이스 **{count}**건을 찾아냈습니다!"
+    st.info(
+        f"분석 결과: 60초 동안 총 **{execs_formatted}번**의 실행을 통해 "
+        f"**{total_traces}**개의 경로를 탐색했습니다."
     )
-    st.dataframe(df_corner_cases, width="stretch", hide_index=True)

@@ -9,7 +9,8 @@ import os
 import hashlib
 import json
 import subprocess
-from typing import Dict, List, Tuple
+import random
+from typing import Dict, List, Tuple, Any
 
 from .db_manager import TraceDBManager
 
@@ -192,3 +193,84 @@ def read_afl_stats(afl_out_dir: str) -> Dict:
         except OSError:
             pass
     return {}
+
+
+def build_trace_tree(program_id: int, db: TraceDBManager) -> Dict[str, Any]:
+    """
+    [T13] DB에 저장된 트레이스 데이터를 기반으로 시각화용 트리 구조 생성.
+    - 자주 방문한 경로는 hit_count가 높음 (Frontend에서 파란색 처리 가능)
+    - 코너 케이스 노드는 is_corner_case=True (Frontend에서 빨간색 처리 가능)
+    """
+    from .db_manager import get_db_connection
+
+    # 1. DB에서 트레이스 및 코너 케이스 정보 가져오기
+    with get_db_connection() as conn:
+        # conn.row_factory = None # 명시적으로 튜플/리스트 반환하게 설정 가능하나 Row 그대로 사용
+        
+        # 코너케이스 정보
+        cc_nodes = conn.execute(
+            "SELECT trace_id, exec_frequency, code_location FROM CornerCaseNode"
+        ).fetchall()
+        cc_map = {row["trace_id"]: row for row in cc_nodes}
+
+        # 전체 트레이스 정보
+        traces = conn.execute(
+            "SELECT id, source FROM DynamicTrace WHERE program_id = ?", (program_id,)
+        ).fetchall()
+
+    if not traces:
+        return {"name": "No Data", "children": []}
+
+    # 2. 트리 루트 생성
+    root = {
+        "name": "Main",
+        "node_id": "root",
+        "hit_count": len(traces),
+        "is_corner_case": False,
+        "children": []
+    }
+
+    # 3. 각 트레이스를 경로로 변환하여 트리에 병합
+    for t in traces:
+        t_id = t["id"]
+        source = t["source"]
+        
+        # 가상의 경로 생성 (AFL++ 소스 -> 노드 구조)
+        # 실제로는 계측 데이터를 통해 얻은 기본 블록 시퀀스를 사용해야 함
+        path = [source]
+        if t_id in cc_map:
+            # 코너케이스는 해당 위치를 경로의 끝으로 설정
+            path.append(cc_map[t_id]["code_location"])
+        else:
+            # 일반 경로는 소스 기반의 가상 지점 생성
+            path.append(f"block_{hash(str(t_id)) % 8}")
+
+        # 경로를 트리에 병합
+        current = root
+        for step in path:
+            found = False
+            for child in current["children"]:
+                if child["name"] == step:
+                    child["hit_count"] += 1
+                    current = child
+                    found = True
+                    break
+            
+            if not found:
+                is_cc = (t_id in cc_map and step == cc_map[t_id]["code_location"])
+                new_node = {
+                    "name": step,
+                    "node_id": f"node_{t_id}_{step}",
+                    "hit_count": 1,
+                    "is_corner_case": is_cc,
+                    "children": []
+                }
+                if is_cc:
+                    # 코너케이스일 때만 코드 스니펫 및 빈도 정보 추가
+                    new_node["code_snippet"] = f"// Vulnerability candidate at {step}\n// Execution frequency: {cc_map[t_id]['exec_frequency']:.6f}"
+                    new_node["frequency"] = cc_map[t_id]["exec_frequency"]
+                
+                current["children"].append(new_node)
+                current = new_node
+
+    return root

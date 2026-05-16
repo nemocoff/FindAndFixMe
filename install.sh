@@ -8,9 +8,12 @@ sudo apt-get install -y cmake build-essential python3-dev libzstd-dev libcurl4-o
 sudo apt-get install -y llvm-16 clang-16 libclang-16-dev
 sudo apt-get install -y libz3-dev z3
 sudo apt-get install -y afl++
+# sudo apt-get install -y libquantlib0-dev # quantlib library test
 
 # 2. Python Dependencies
 echo "Installing Python API & Frontend Dependencies..."
+python3 -m venv venv
+source venv/bin/activate
 python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
 
@@ -25,5 +28,5 @@ make
 echo ""
 echo "Installation Complete!"
 echo "To start the system, open two terminals:"
-echo "1. uvicorn backend.api:app --reload (FastAPI Backend)"
+echo "1. uvicorn backend.api:app --host 0.0.0.0 --port 8000 --reload (FastAPI Backend)"
 echo "2. streamlit run frontend/app.py (Streamlit Frontend)"

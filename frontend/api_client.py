@@ -27,6 +27,11 @@ def get_corner_cases(program_id):
     response.raise_for_status()
     return response.json()
 
+def get_trace_tree(program_id):
+    response = requests.get(f"{API_BASE_URL}/target/{program_id}/tree-map")
+    response.raise_for_status()
+    return response.json()
+
 def inject_mutation(node_id, pattern_id):
     payload = {"node_id": node_id, "pattern_id": pattern_id}
     response = requests.post(f"{API_BASE_URL}/mutations/inject", json=payload)
