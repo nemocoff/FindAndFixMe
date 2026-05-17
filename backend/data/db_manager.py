@@ -1,10 +1,13 @@
+import os
 import sqlite3
 import threading
 import hashlib
 from contextlib import contextmanager
 from typing import Optional, List, Dict, Any
 
-DB_PATH = "trace_data.sqlite"
+# [수정] 백그라운드 스레드에서 상대 경로를 잃어버리는 현상을 방지하기 위해 절대경로 강제
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DB_PATH = os.path.join(BASE_DIR, "trace_data.sqlite")
 
 # ─────────────────────────────────────────────
 # [T5] Thread-local connection pool + WAL mode
@@ -25,16 +28,19 @@ def get_db_connection(db_path: str = DB_PATH):
     is_new = conn is None
 
     if is_new:
-        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn = sqlite3.connect(db_path, timeout=60.0, check_same_thread=False)
+        # 쿼리 결과를 딕셔너리 형태로 접근할 수 있도록 설정
+        conn.row_factory = sqlite3.Row
         # WAL 모드: 동시 읽기를 블로킹하지 않음
         conn.execute("PRAGMA journal_mode=WAL;")
+        # 바쁜 대기 시간 60초로 확장하여 'database is locked' 예방
+        conn.execute("PRAGMA busy_timeout=60000;")
         # 성능-내구성 균형
         conn.execute("PRAGMA synchronous=NORMAL;")
         # 64MB 페이지 캐시
         conn.execute("PRAGMA cache_size=-65536;")
         # FK 제약 활성화
         conn.execute("PRAGMA foreign_keys=ON;")
-        conn.row_factory = sqlite3.Row
         _thread_local.conns[db_path] = conn
 
     try:
@@ -81,10 +87,15 @@ class TraceDBManager:
                     input_hash TEXT UNIQUE NOT NULL,
                     raw_input BLOB,
                     source TEXT CHECK(source IN ('afl_queue','afl_crash','afl_hang')),
+                    execution_path TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(program_id) REFERENCES TargetProgram(id) ON DELETE CASCADE
                 )
             ''')
+            try:
+                cursor.execute("ALTER TABLE DynamicTrace ADD COLUMN execution_path TEXT")
+            except Exception:
+                pass
 
             # 3. CornerCaseNode — 유동적인 코너 케이스 탐지 지원을 위해 CHECK 제약 제거
             cursor.execute('''
@@ -135,15 +146,15 @@ class TraceDBManager:
     # ─────────────────────────────────────────────
     # [T6, T7] 트레이스 적재 — MD5 해시 중복 제거
     # ─────────────────────────────────────────────
-    def insert_trace(self, program_id: int, raw_input: bytes, source: str) -> Optional[int]:
+    def insert_trace(self, program_id: int, raw_input: bytes, source: str, execution_path: Optional[str] = None) -> Optional[int]:
         """중복 입력을 MD5 해시로 필터링 후 DynamicTrace에 INSERT."""
         input_hash = hashlib.md5(raw_input).hexdigest()
         with get_db_connection(self.db_path) as conn:
             try:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "INSERT INTO DynamicTrace (program_id, input_hash, raw_input, source) VALUES (?,?,?,?)",
-                    (program_id, input_hash, raw_input, source)
+                    "INSERT INTO DynamicTrace (program_id, input_hash, raw_input, source, execution_path) VALUES (?,?,?,?,?)",
+                    (program_id, input_hash, raw_input, source, execution_path)
                 )
                 conn.commit()
                 return cursor.lastrowid
@@ -219,3 +230,7 @@ class TraceDBManager:
         with get_db_connection(self.db_path) as conn:
             row = conn.execute("SELECT COUNT(*) FROM DynamicTrace WHERE program_id=?", (program_id,)).fetchone()
             return row[0] if row else 0
+
+    def get_trace_stats(self, program_id: int) -> dict:
+        total = self.get_trace_count(program_id)
+        return {"total": total}

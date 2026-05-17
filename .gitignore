@@ -8,6 +8,7 @@ core/test_target.cpp
 inspect_mutations.py
 afl_output/
 temp_targets/
+scratch/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

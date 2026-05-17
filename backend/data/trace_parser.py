@@ -48,21 +48,128 @@ def _find_afl_dirs(afl_out_dir: str, subdir_name: str) -> list:
     return found
 
 
+def _run_binary_in_docker(binary_path: str, stdin_data: bytes) -> str:
+    """정규 바이너리를 Docker에서 실행하고 stderr(함수 추적 로그)를 리턴"""
+    import subprocess
+    import platform
+    prog_dir_host = os.path.dirname(os.path.abspath(binary_path))
+    binary_name = os.path.basename(binary_path)
+    
+    # 임시 시드 파일 작성 (LibFuzzer 바이너리가 인자로 읽을 수 있게 함)
+    import uuid
+    temp_seed_name = f"temp_seed_{uuid.uuid4().hex[:12]}"
+    temp_seed_host = os.path.join(prog_dir_host, temp_seed_name)
+    try:
+        with open(temp_seed_host, "wb") as f:
+            f.write(stdin_data)
+    except Exception as e:
+        print(f"[Trace Capture] Warning: failed to write temp seed file: {e}")
+        temp_seed_name = None
+
+    # 윈도우 환경 대응 및 Docker 마운트 설정
+    mounts_opt = f"{os.path.abspath(prog_dir_host)}:/target"
+    
+    try:
+        user_opt = "root" if platform.system() == "Windows" else f"{os.getuid()}:{os.getgid()}"
+    except AttributeError:
+        user_opt = "root"
+        
+    cmd = [
+        "docker", "run", "--rm", "-i",
+        "--network", "none",
+        "--user", user_opt,
+        "-v", mounts_opt,
+        "findandfixme/aflplusplus:latest",
+        f"/target/{binary_name}"
+    ]
+    if temp_seed_name:
+        cmd.append(f"/target/{temp_seed_name}")
+    
+    try:
+        res = subprocess.run(cmd, input=stdin_data, capture_output=True, timeout=10)
+        return res.stderr.decode("utf-8", errors="ignore")
+    except Exception as e:
+        print(f"[Trace Capture Error] {e}")
+        return ""
+    finally:
+        if temp_seed_name and os.path.exists(temp_seed_host):
+            try:
+                os.remove(temp_seed_host)
+            except:
+                pass
+
+
+def _parse_execution_addresses(stderr_output: str) -> List[str]:
+    """[ENTER] 0x... 로그 라인을 파싱하여 유니크 헥사 주소 목록 생성"""
+    addrs = []
+    seen = set()
+    for line in stderr_output.splitlines():
+        if line.startswith("[ENTER] "):
+            addr = line[8:].strip()
+            if addr not in seen:
+                seen.add(addr)
+                addrs.append(addr)
+    return addrs
+
+
+def _resolve_addresses_with_addr2line(binary_path: str, addresses: List[str]) -> List[str]:
+    """addr2line을 Docker 내부에서 호출하여 메모리 주소를 demangle된 실제 C++ 함수명으로 변환"""
+    if not addresses:
+        return []
+    import subprocess
+    import platform
+    prog_dir_host = os.path.dirname(os.path.abspath(binary_path))
+    binary_name = os.path.basename(binary_path)
+    mounts_opt = f"{os.path.abspath(prog_dir_host)}:/target"
+    
+    try:
+        user_opt = "root" if platform.system() == "Windows" else f"{os.getuid()}:{os.getgid()}"
+    except AttributeError:
+        user_opt = "root"
+        
+    # addr2line -f -C -e <binary> <addr1> <addr2> ...
+    cmd = [
+        "docker", "run", "--rm", "-i",
+        "--network", "none",
+        "--user", user_opt,
+        "-v", mounts_opt,
+        "findandfixme/aflplusplus:latest",
+        "addr2line", "-f", "-C", "-e", f"/target/{binary_name}"
+    ] + addresses
+    
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        lines = res.stdout.splitlines()
+        # addr2line -f 출력은 2줄당 1개 심볼 (첫줄: 함수명, 둘째줄: 파일명:라인)
+        resolved = []
+        for i in range(0, len(lines), 2):
+            if i < len(lines):
+                func_name = lines[i].strip()
+                # 만약 ?? 이거나 알 수 없는 함수명이면 주소 그대로 노출
+                if func_name == "??" or not func_name:
+                    resolved.append(addresses[i // 2])
+                else:
+                    resolved.append(func_name)
+        return resolved
+    except Exception as e:
+        print(f"[Symbol Resolution Error] {e}")
+        return addresses
+
+
 def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> Dict:
     """
     AFL++ 출력 디렉토리를 순회하며:
       1. 파일을 읽어 raw bytes 수집
       2. MD5 해시로 중복 제거 (T6)
-      3. DynamicTrace DB에 INSERT
-      4. exec_frequency 계산 → 코너 케이스 분류 후 CornerCaseNode INSERT (T9)
-
-    Returns:
-        stats dict: {"total", "inserted", "duplicates", "corner_cases", "errors"}
+      3. 대표 20개 Normal Path 및 모든 크래시/행만 Docker 실측 계측 수행 (타임아웃 방지 초고속 최적화)
+      4. DynamicTrace DB에 INSERT (실제 실행 경로 JSON 포함)
+      5. exec_frequency 계산 → 코너 케이스 분류 후 CornerCaseNode INSERT (T9)
     """
     stats = {"total": 0, "inserted": 0, "duplicates": 0, "corner_cases": 0, "errors": 0}
 
     # ── 1. 모든 AFL++ 출력 파일 수집 ──────────────────────────────────────
-    raw_entries: List[Tuple[bytes, str]] = []  # (raw_bytes, source_label)
+    normal_entries: List[Tuple[bytes, str]] = []
+    critical_entries: List[Tuple[bytes, str]] = []
 
     for subdir, label in AFL_SOURCE_DIRS:
         for dir_path in _find_afl_dirs(afl_out_dir, subdir):
@@ -72,40 +179,115 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
                     continue
                 try:
                     with open(fpath, "rb") as f:
-                        raw_entries.append((f.read(), label))
+                        data = f.read()
+                        if label == "afl_queue":
+                            normal_entries.append((data, label))
+                        else:
+                            critical_entries.append((data, label))
                     stats["total"] += 1
                 except OSError:
                     stats["errors"] += 1
 
-    if not raw_entries:
+    if not normal_entries and not critical_entries:
         return stats
 
-    total = len(raw_entries)
+    # ── 2. 중복 제거 ────────────────────────────────────────────────────────
+    seen_hashes = set()
+    unique_normal = []
+    for data, label in normal_entries:
+        h = hashlib.md5(data).hexdigest()
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            unique_normal.append((data, label))
 
-    # ── 2. 중복 제거 + DB 적재 ────────────────────────────────────────────
-    inserted: List[Tuple[int, str, int]] = []  # (trace_id, source, original_index)
+    unique_critical = []
+    for data, label in critical_entries:
+        h = hashlib.md5(data).hexdigest()
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            unique_critical.append((data, label))
 
-    for idx, (raw_bytes, source) in enumerate(raw_entries):
-        trace_id = db.insert_trace(program_id, raw_bytes, source)
+    # ── 3. 시간적 흐름에 따른 고른 분포를 가진 대표 Normal Path 20개 샘플링 ──
+    max_normal_samples = 20
+    if len(unique_normal) > max_normal_samples:
+        step = len(unique_normal) / max_normal_samples
+        sampled_normal = [unique_normal[int(i * step)] for i in range(max_normal_samples)]
+    else:
+        sampled_normal = unique_normal
+
+    sampled_normal_set = set(sampled_normal)
+    all_unique = unique_normal + unique_critical
+    total = len(all_unique)
+
+    # ── 4. 실측 경로 추출 및 DB 적재 (ThreadPoolExecutor 병렬 실행 최적화) ──
+    from concurrent.futures import ThreadPoolExecutor
+
+    # 코너케이스 임계치를 미리 산출하여 실행 대상 선별에 활용
+    dynamic_threshold = max(CORNER_CASE_THRESHOLD, 2.0 / total if total > 0 else 0)
+
+    # DB에서 빌드된 정규 바이너리 경로 조회
+    prog_info = db.get_program(program_id)
+    binary_path = prog_info.get("binary_path") if prog_info else None
+
+    # 병렬 처리를 위해 실행할 대상 수집
+    targets_to_run = []
+    for idx, (raw_bytes, source) in enumerate(all_unique):
+        # 해당 노드가 코너케이스에 해당하는지 사전 판별
+        if source in ("afl_crash", "afl_hang"):
+            is_cc = True
+        else:
+            exec_freq = (total - idx) / total if total > 0 else 1.0
+            is_cc = (exec_freq < dynamic_threshold)
+
+        # 코너케이스이거나 대표 샘플인 경우 무조건 Docker 실측 실행
+        should_run_docker = is_cc or ((raw_bytes, source) in sampled_normal_set)
+        if should_run_docker and binary_path and os.path.exists(binary_path):
+            targets_to_run.append((idx, raw_bytes, source))
+
+    # 스레드 작업 정의
+    def _worker(item):
+        idx, raw_bytes, source = item
+        stderr_out = _run_binary_in_docker(binary_path, raw_bytes)
+        addrs = _parse_execution_addresses(stderr_out)
+        exec_path = None
+        if addrs:
+            exec_path = _resolve_addresses_with_addr2line(binary_path, addrs)
+        return idx, exec_path
+
+    # 최대 8개 병렬 스레드로 Docker 실행 가속 (WSL2 Docker 기동 지연 극복)
+    resolved_paths = {}
+    if targets_to_run:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = executor.map(_worker, targets_to_run)
+            for idx, exec_path in results:
+                if exec_path:
+                    resolved_paths[idx] = exec_path
+
+    inserted: List[Tuple[int, str, int, str]] = []  # (trace_id, source, original_index, code_location)
+
+    for idx, (raw_bytes, source) in enumerate(all_unique):
+        execution_path_json = None
+        code_loc = f"afl_node_{idx}"
+
+        exec_path = resolved_paths.get(idx)
+        if exec_path:
+            execution_path_json = json.dumps(exec_path)
+            code_loc = exec_path[-1]  # 마지막 실행 지점을 함수명으로 마킹
+
+        trace_id = db.insert_trace(program_id, raw_bytes, source, execution_path_json)
         if trace_id is None:
-            # MD5 충돌 → 중복, 건너뜀
             stats["duplicates"] += 1
             continue
         stats["inserted"] += 1
-        inserted.append((trace_id, source, idx))
+        inserted.append((trace_id, source, idx, code_loc))
 
-    # ── 3. exec_frequency 계산 → 코너 케이스 분류 (T9) ───────────────────
-    # queue 항목: AFL++가 나중에 발견한 경로일수록 희귀 (index / total)
-    # crash/hang: 정의상 항상 코너 케이스 (freq = 0.001)
-
-    # 전체 개수가 적을 때는 1% 고정값이 너무 엄격하므로 최소 1개는 포함하도록 유동적 기준 적용
+    # ── 5. exec_frequency 계산 → 코너 케이스 분류 (T9) ────────────────────
     dynamic_threshold = max(CORNER_CASE_THRESHOLD, 2.0 / total if total > 0 else 0)
 
-    for trace_id, source, idx in inserted:
+    for trace_id, source, idx, code_loc in inserted:
         if source in ("afl_crash", "afl_hang"):
             exec_freq = CRASH_EXEC_FREQ
         else:
-            # 나중에 발견된 경로(큰 idx)일수록 더 희귀함 -> (total - idx) / total 로 계산
             exec_freq = (total - idx) / total if total > 0 else 1.0
 
         if exec_freq < dynamic_threshold:
@@ -114,11 +296,10 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
                     trace_id=trace_id,
                     node_type=source,
                     exec_frequency=exec_freq,
-                    code_location=f"afl_node_{idx}"
+                    code_location=code_loc
                 )
                 stats["corner_cases"] += 1
             except Exception:
-                # DB 제약 위반 등 예외 처리
                 stats["errors"] += 1
 
     return stats
@@ -198,24 +379,33 @@ def read_afl_stats(afl_out_dir: str) -> Dict:
 def build_trace_tree(program_id: int, db: TraceDBManager) -> Dict[str, Any]:
     """
     [T13] DB에 저장된 트레이스 데이터를 기반으로 시각화용 트리 구조 생성.
-    - 자주 방문한 경로는 hit_count가 높음 (Frontend에서 파란색 처리 가능)
-    - 코너 케이스 노드는 is_corner_case=True (Frontend에서 빨간색 처리 가능)
+    - 실제 함수 추적 경로가 저장되어 있는 경우 실제 경로를 활용.
+    - 자주 방문한 경로는 hit_count가 높음.
+    - 코너 케이스 노드는 is_corner_case=True.
     """
     from .db_manager import get_db_connection
 
+    import sqlite3
     # 1. DB에서 트레이스 및 코너 케이스 정보 가져오기
     with get_db_connection() as conn:
-        conn.row_factory = None # 명시적으로 튜플/리스트 반환하게 설정 가능하나 Row 그대로 사용
+        conn.row_factory = sqlite3.Row
         
         # 코너케이스 정보
         cc_nodes = conn.execute(
             "SELECT trace_id, exec_frequency, code_location FROM CornerCaseNode"
         ).fetchall()
-        cc_map = {row["trace_id"]: row for row in cc_nodes}
+        
+        cc_map = {}
+        for row in cc_nodes:
+            try:
+                tid = row["trace_id"]
+                cc_map[tid] = dict(row)
+            except (TypeError, IndexError):
+                cc_map[row[0]] = {"trace_id": row[0], "exec_frequency": row[1], "code_location": row[2]}
 
-        # 전체 트레이스 정보
+        # 전체 트레이스 정보 (execution_path 컬럼 추가 조회)
         traces = conn.execute(
-            "SELECT id, source FROM DynamicTrace WHERE program_id = ?", (program_id,)
+            "SELECT id, source, execution_path FROM DynamicTrace WHERE program_id = ?", (program_id,)
         ).fetchall()
 
     if not traces:
@@ -230,20 +420,37 @@ def build_trace_tree(program_id: int, db: TraceDBManager) -> Dict[str, Any]:
         "children": []
     }
 
+    # 카테고리 매핑
+    SOURCE_LABEL_MAP = {
+        "afl_queue": "Normal Paths",
+        "afl_crash": "Crash Paths",
+        "afl_hang": "Timeout Paths"
+    }
+
     # 3. 각 트레이스를 경로로 변환하여 트리에 병합
     for t in traces:
         t_id = t["id"]
         source = t["source"]
+        source_label = SOURCE_LABEL_MAP.get(source, source)
         
-        # 가상의 경로 생성 (AFL++ 소스 -> 노드 구조)
-        # 실제로는 계측 데이터를 통해 얻은 기본 블록 시퀀스를 사용해야 함
-        path = [source]
-        if t_id in cc_map:
-            # 코너케이스는 해당 위치를 경로의 끝으로 설정
-            path.append(cc_map[t_id]["code_location"])
+        exec_path_json = t["execution_path"]
+        exec_path = None
+        if exec_path_json:
+            try:
+                exec_path = json.loads(exec_path_json)
+            except:
+                pass
+
+        if exec_path:
+            # 100% 실제 함수 호출 체인 적용
+            path = [source_label] + exec_path
         else:
-            # 일반 경로는 소스 기반의 가상 지점 생성
-            path.append(f"block_{hash(str(t_id)) % 8}")
+            # 가상의 경로 대신 직관적이고 깔끔한 경로명 표시
+            path = [source_label]
+            if t_id in cc_map:
+                path.append(cc_map[t_id]["code_location"])
+            else:
+                path.append(f"Normal Path {t_id}")
 
         # 경로를 트리에 병합
         current = root
@@ -252,12 +459,21 @@ def build_trace_tree(program_id: int, db: TraceDBManager) -> Dict[str, Any]:
             for child in current["children"]:
                 if child["name"] == step:
                     child["hit_count"] += 1
+                    # 만약 이 기존 노드가 이번 트레이스에서 코너케이스 지점이라면 코너케이스 플래그 및 메타데이터 업데이트!
+                    if t_id in cc_map and step == cc_map[t_id]["code_location"]:
+                        child["is_corner_case"] = True
+                        child["code_snippet"] = f"// Vulnerability candidate at {step}\n// Execution frequency: {cc_map[t_id]['exec_frequency']:.6f}"
+                        child["frequency"] = cc_map[t_id]["exec_frequency"]
                     current = child
                     found = True
                     break
             
             if not found:
-                is_cc = (t_id in cc_map and step == cc_map[t_id]["code_location"])
+                is_cc = False
+                if t_id in cc_map:
+                    # 코너케이스 여부 확인: 현재 노드가 해당 트레이스 코너케이스의 code_location이거나 마지막 스텝인 경우
+                    is_cc = (step == cc_map[t_id]["code_location"])
+
                 new_node = {
                     "name": step,
                     "node_id": f"node_{t_id}_{step}",
@@ -266,7 +482,6 @@ def build_trace_tree(program_id: int, db: TraceDBManager) -> Dict[str, Any]:
                     "children": []
                 }
                 if is_cc:
-                    # 코너케이스일 때만 코드 스니펫 및 빈도 정보 추가
                     new_node["code_snippet"] = f"// Vulnerability candidate at {step}\n// Execution frequency: {cc_map[t_id]['exec_frequency']:.6f}"
                     new_node["frequency"] = cc_map[t_id]["exec_frequency"]
                 
