@@ -9,6 +9,7 @@ inspect_mutations.py
 afl_output/
 temp_targets/
 scratch/
+tests.zip
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -26,6 +26,42 @@ CRASH_EXEC_FREQ = 0.001
 CORNER_CASE_THRESHOLD = 0.01   # [T9] 1% 미만 = 코너 케이스
 
 
+def _get_host_absolute_path(container_abs_path: str) -> str:
+    """
+    백엔드 컨테이너 내부의 절대 경로(예: /app/temp_targets/23/...)를
+    호스트 윈도우 상의 물리적 절대 경로(예: /c/vscode/FindAndFixMe/temp_targets/23/...)로 변환합니다.
+    DooD(Docker-out-of-Docker) 구동 시 -v 마운트 인자에 호스트 경로를 넣기 위해 필수적입니다.
+    """
+    p = container_abs_path.replace("\\", "/")
+    # 만약 /app 으로 시작한다면, 호스트 상의 FindAndFixMe 루트 폴더로 치환
+    if p.startswith("/app/"):
+        return "/c/vscode/FindAndFixMe/" + p[5:]
+    if p.startswith("/app"):
+        return "/c/vscode/FindAndFixMe"
+    # 만약 /mnt/c/ 로 시작한다면, C:/ 로 치환
+    if p.startswith("/mnt/c/"):
+        return "/c/" + p[7:]
+    
+    # 일반 드라이브 문자 경로(예: C:/...) 변환
+    if len(p) >= 2 and p[0].isalpha() and p[1] == ":":
+        drive = p[0].lower()
+        return f"/{drive}{p[2:]}"
+    
+    return p
+
+
+def _get_container_internal_path(path: str) -> str:
+    """
+    백엔드 내부 절대 경로(예: /mnt/c/vscode/FindAndFixMe/temp_targets/QuantLib_35/fuzzinterpolations_bin)를
+    도커 컨테이너가 마운트한 격리 디렉토리 기준 경로(예: /app/temp_targets/QuantLib_35/fuzzinterpolations_bin)로 정밀 변환합니다.
+    """
+    p = path.replace("\\", "/")
+    for prefix in ["/mnt/c/vscode/FindAndFixMe", "/c/vscode/FindAndFixMe", "C:/vscode/FindAndFixMe", "c:/vscode/FindAndFixMe"]:
+        if p.startswith(prefix):
+            return "/app" + p[len(prefix):]
+    return p
+
+
 def _find_afl_dirs(afl_out_dir: str, subdir_name: str) -> list:
     """
     AFL++는 -o <dir> 실행 시 <dir>/default/<subdir> 구조로 출력을 생성합니다.
@@ -52,49 +88,93 @@ def _run_binary_in_docker(binary_path: str, stdin_data: bytes) -> str:
     """정규 바이너리를 Docker에서 실행하고 stderr(함수 추적 로그)를 리턴"""
     import subprocess
     import platform
-    prog_dir_host = os.path.dirname(os.path.abspath(binary_path))
-    binary_name = os.path.basename(binary_path)
+    abs_binary_path = os.path.abspath(binary_path).replace("\\", "/")
+    print(f"\n[Trace Capture] === Start Trace Capture for {abs_binary_path} ===")
     
-    # 임시 시드 파일 작성 (LibFuzzer 바이너리가 인자로 읽을 수 있게 함)
+    # [정밀 격리] 수동으로 /app/ 등 경로 매핑을 조작하면 도커 자동 인터셉트가 깨지거나 경로 불일치가 발생합니다.
+    # 바이너리가 실제 존재하는 오리지널 부모 절대 경로를 그대로 격리 디렉토리로 잡습니다.
+    prog_target_dir = os.path.dirname(abs_binary_path)
+    print(f"[Trace Capture] Extracted program target directory inside container: {prog_target_dir}")
+            
+    # [DooD 자동 매핑 연동] 실제 존재하는 prog_target_dir를 마운트하여 Docker Desktop의 WSL2 자동 번역을 완벽하게 활성화합니다!
+    mounts_opt = f"{prog_target_dir}:{prog_target_dir}"
+    print(f"[Trace Capture] Volume mount mapping (Host:Container): -v {mounts_opt}")
+    
+    # [공유 라이브러리 링커 검색기] 타깃 폴더 하위에서 모든 빌드된 .so 경로 수집하여 LD_LIBRARY_PATH 주입
+    lib_dirs = set()
+    if os.path.exists(prog_target_dir):
+        for root_p, _, files_p in os.walk(prog_target_dir):
+            for fp in files_p:
+                if fp.endswith(".so") or ".so." in fp:
+                    lib_dirs.add(root_p.replace("\\", "/"))
+                    break
+    
+    print(f"[Trace Capture] Discovered Shared Library Folders: {list(lib_dirs)}")
+    
+    env_opts = []
+    if lib_dirs:
+        env_opts = ["-e", f"LD_LIBRARY_PATH={':'.join(lib_dirs)}"]
+    
+    # [정밀 매핑] 소스 마운트와 컨테이너 매핑 경로가 완전 일치하므로 가공 없이 원본 경로를 실행 경로로 삼습니다!
+    container_binary = abs_binary_path
+    print(f"[Trace Capture] Mapped container target binary execution path: {container_binary}")
+    
+    # [DooD 강제 루트 권한 지정] 도커 데몬이 윈도우 호스트 상에서 구동 중이므로, WSL2 내부 UID(1000)는 권한 충돌을 뿜습니다.
+    # 안전하게 root 권한을 부여하여 윈도우 파일 시스템 상의 마운트 파일에 대한 무제한 실행을 보장합니다.
+    user_opt = "root"
+        
+    cmd = [
+        "docker", "run", "--rm", "-i"
+    ] + env_opts + [
+        "--network", "none",
+        "--user", user_opt,
+        "-v", mounts_opt,
+        "findandfixme/aflplusplus:latest",
+        container_binary
+    ]
+    
+    # 임시 시드 파일은 바이너리와 동일 폴더에 작성
+    prog_dir_host = os.path.dirname(os.path.abspath(binary_path))
     import uuid
     temp_seed_name = f"temp_seed_{uuid.uuid4().hex[:12]}"
     temp_seed_host = os.path.join(prog_dir_host, temp_seed_name)
     try:
         with open(temp_seed_host, "wb") as f:
             f.write(stdin_data)
+        
+        # [정밀 매핑] 소스 마운트와 컨테이너 매핑 경로가 완전 일치하므로 가공 없이 원본 시드 경로를 그대로 전달합니다!
+        container_seed = os.path.join(os.path.dirname(abs_binary_path), temp_seed_name)
+        cmd.append(container_seed)
+        print(f"[Trace Capture] Temporary Seed Written (Host): {temp_seed_host}")
+        print(f"[Trace Capture] Mapped container seed path: {container_seed}")
     except Exception as e:
         print(f"[Trace Capture] Warning: failed to write temp seed file: {e}")
-        temp_seed_name = None
-
-    # 윈도우 환경 대응 및 Docker 마운트 설정
-    mounts_opt = f"{os.path.abspath(prog_dir_host)}:/target"
+        temp_seed_host = None
     
-    try:
-        user_opt = "root" if platform.system() == "Windows" else f"{os.getuid()}:{os.getgid()}"
-    except AttributeError:
-        user_opt = "root"
-        
-    cmd = [
-        "docker", "run", "--rm", "-i",
-        "--network", "none",
-        "--user", user_opt,
-        "-v", mounts_opt,
-        "findandfixme/aflplusplus:latest",
-        f"/target/{binary_name}"
-    ]
-    if temp_seed_name:
-        cmd.append(f"/target/{temp_seed_name}")
+    print(f"[Trace Capture] Invoking Subprocess Command: {' '.join(cmd)}")
     
     try:
         res = subprocess.run(cmd, input=stdin_data, capture_output=True, timeout=10)
-        return res.stderr.decode("utf-8", errors="ignore")
+        stderr_str = res.stderr.decode("utf-8", errors="ignore")
+        stdout_str = res.stdout.decode("utf-8", errors="ignore")
+        
+        print(f"[Trace Capture] Subprocess Return Code: {res.returncode}")
+        print(f"[Trace Capture] Raw stdout length: {len(stdout_str)} chars")
+        print(f"[Trace Capture] Raw stderr length: {len(stderr_str)} chars")
+        if stderr_str:
+            print(f"[Trace Capture] Raw stderr snippet (first 150 chars):\n{stderr_str[:150]}")
+        else:
+            print("[Trace Capture] WARNING: stderr is completely empty! Execution didn't log [ENTER] addresses.")
+            
+        return stderr_str
     except Exception as e:
-        print(f"[Trace Capture Error] {e}")
+        print(f"[Trace Capture Exception] Critical error running binary inside container: {e}")
         return ""
     finally:
-        if temp_seed_name and os.path.exists(temp_seed_host):
+        if temp_seed_host and os.path.exists(temp_seed_host):
             try:
                 os.remove(temp_seed_host)
+                print(f"[Trace Capture] Safely cleaned up temporary seed: {temp_seed_host}")
             except:
                 pass
 
@@ -109,51 +189,96 @@ def _parse_execution_addresses(stderr_output: str) -> List[str]:
             if addr not in seen:
                 seen.add(addr)
                 addrs.append(addr)
+    print(f"[Trace Parser] Parsed {len(addrs)} unique execution addresses from logs.")
     return addrs
 
 
 def _resolve_addresses_with_addr2line(binary_path: str, addresses: List[str]) -> List[str]:
     """addr2line을 Docker 내부에서 호출하여 메모리 주소를 demangle된 실제 C++ 함수명으로 변환"""
     if not addresses:
+        print("[Addr2Line Resolution] No addresses requested for resolution.")
         return []
     import subprocess
     import platform
-    prog_dir_host = os.path.dirname(os.path.abspath(binary_path))
-    binary_name = os.path.basename(binary_path)
-    mounts_opt = f"{os.path.abspath(prog_dir_host)}:/target"
     
-    try:
-        user_opt = "root" if platform.system() == "Windows" else f"{os.getuid()}:{os.getgid()}"
-    except AttributeError:
-        user_opt = "root"
+    abs_binary_path = os.path.abspath(binary_path).replace("\\", "/")
+    print(f"\n[Addr2Line Resolution] === Start Demangling {len(addresses)} Addresses ===")
+    
+    # [정밀 격리] 수동으로 /app/ 등 경로 매핑을 조작하면 도커 자동 인터셉트가 깨지거나 경로 불일치가 발생합니다.
+    # 바이너리가 실제 존재하는 오리지널 부모 절대 경로를 그대로 격리 디렉토리로 잡습니다.
+    prog_target_dir = os.path.dirname(abs_binary_path)
+    
+    # [DooD 자동 매핑 연동] 실제 존재하는 prog_target_dir를 마운트하여 Docker Desktop의 WSL2 자동 번역을 완벽하게 활성화합니다!
+    mounts_opt = f"{prog_target_dir}:{prog_target_dir}"
+    
+    # [공유 라이브러리 링커 검색기] 타깃 폴더 하위에서 모든 빌드된 .so 경로 수집하여 LD_LIBRARY_PATH 주입
+    lib_dirs = set()
+    if os.path.exists(prog_target_dir):
+        for root_p, _, files_p in os.walk(prog_target_dir):
+            for fp in files_p:
+                if fp.endswith(".so") or ".so." in fp:
+                    lib_dirs.add(root_p.replace("\\", "/"))
+                    break
+    
+    env_opts = []
+    if lib_dirs:
+        env_opts = ["-e", f"LD_LIBRARY_PATH={':'.join(lib_dirs)}"]
+    
+    # [정밀 매핑] 소스 마운트와 컨테이너 매핑 경로가 완전 일치하므로 가공 없이 원본 경로를 실행 경로로 삼습니다!
+    container_binary = abs_binary_path
+    print(f"[Addr2Line Resolution] Mapped container target binary path: {container_binary}")
         
-    # addr2line -f -C -e <binary> <addr1> <addr2> ...
+    # [DooD 강제 루트 권한 지정] 도커 데몬이 윈도우 호스트 상에서 구동 중이므로, WSL2 내부 UID(1000)는 권한 충돌을 뿜습니다.
+    # 안전하게 root 권한을 부여하여 윈도우 파일 시스템 상의 마운트 파일에 대한 무제한 실행을 보장합니다.
+    user_opt = "root"
+        
     cmd = [
-        "docker", "run", "--rm", "-i",
+        "docker", "run", "--rm", "-i"
+    ] + env_opts + [
         "--network", "none",
         "--user", user_opt,
         "-v", mounts_opt,
         "findandfixme/aflplusplus:latest",
-        "addr2line", "-f", "-C", "-e", f"/target/{binary_name}"
+        "addr2line", "-f", "-C", "-e", container_binary
     ] + addresses
+    
+    print(f"[Addr2Line Resolution] Invoking Command: {' '.join(cmd)}")
     
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        lines = res.stdout.splitlines()
-        # addr2line -f 출력은 2줄당 1개 심볼 (첫줄: 함수명, 둘째줄: 파일명:라인)
-        resolved = []
+        stdout_str = res.stdout if res.stdout else ""
+        stderr_str = res.stderr if res.stderr else ""
+        
+        print(f"[Addr2Line Resolution] Return Code: {res.returncode}")
+        print(f"[Addr2Line Resolution] Raw stdout length: {len(stdout_str)} chars")
+        print(f"[Addr2Line Resolution] Raw stderr length: {len(stderr_str)} chars")
+        
+        lines = stdout_str.splitlines()
+        demangled_names = []
+        
+        # addr2line은 2라인 단위로 출력 (1라인: 함수명, 2라인: 파일명:라인)
         for i in range(0, len(lines), 2):
-            if i < len(lines):
-                func_name = lines[i].strip()
-                # 만약 ?? 이거나 알 수 없는 함수명이면 주소 그대로 노출
-                if func_name == "??" or not func_name:
-                    resolved.append(addresses[i // 2])
-                else:
-                    resolved.append(func_name)
-        return resolved
+            func = lines[i].strip()
+            if i + 1 < len(lines):
+                file_line = lines[i+1].strip()
+            else:
+                file_line = "??"
+            
+            # 해독이 완전히 실패하면 "??", 그렇지 않으면 깨끗한 명칭 삽입
+            if func == "??" or not func:
+                demangled_names.append("??")
+            else:
+                demangled_names.append(f"{func} ({file_line})")
+                
+        q_count = demangled_names.count("??")
+        print(f"[Addr2Line Resolution] Successfully resolved {len(demangled_names) - q_count} symbols, failed {q_count} symbols.")
+        if q_count > 0:
+            print(f"[Addr2Line Resolution] WARNING: Some symbols resolved as '??'. Double check if debugging symbols (-g) are present in the target compile.")
+            
+        return demangled_names
     except Exception as e:
-        print(f"[Symbol Resolution Error] {e}")
-        return addresses
+        print(f"[Addr2Line Exception] Critical failure running addr2line: {e}")
+        return []
 
 
 def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> Dict:
@@ -207,8 +332,8 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
             seen_hashes.add(h)
             unique_critical.append((data, label))
 
-    # ── 3. 시간적 흐름에 따른 고른 분포를 가진 대표 Normal Path 20개 샘플링 ──
-    max_normal_samples = 20
+    # ── 3. 시간적 흐름에 따른 고른 분포를 가진 대표 Normal Path 샘플링 (150개로 대폭 확장) ──
+    max_normal_samples = 150
     if len(unique_normal) > max_normal_samples:
         step = len(unique_normal) / max_normal_samples
         sampled_normal = [unique_normal[int(i * step)] for i in range(max_normal_samples)]
@@ -244,30 +369,130 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
         if should_run_docker and binary_path and os.path.exists(binary_path):
             targets_to_run.append((idx, raw_bytes, source))
 
-    # 스레드 작업 정의
-    def _worker(item):
+    # [Docker 실행 횟수 제한] 실측 컨테이너 기동 최적화 한계를 150개로 대폭 확장
+    MAX_DOCKER_RUNS = 150
+    if len(targets_to_run) > MAX_DOCKER_RUNS:
+        # 크래시/행 시드를 우선 선별, 나머지는 정상 샘플에서 채움
+        critical = [t for t in targets_to_run if t[2] in ("afl_crash", "afl_hang")]
+        normal = [t for t in targets_to_run if t[2] not in ("afl_crash", "afl_hang")]
+        targets_to_run = critical[:MAX_DOCKER_RUNS] + normal[:max(0, MAX_DOCKER_RUNS - len(critical))]
+        print(f"[Trace Optimizer] Capped Docker runs: {len(targets_to_run)} (critical={len(critical)})")
+
+    # Phase 1: 바이너리 실행 (병렬) → 함수 주소만 수집 (addr2line은 아직 안 함)
+    def _run_worker(item):
         idx, raw_bytes, source = item
         stderr_out = _run_binary_in_docker(binary_path, raw_bytes)
         addrs = _parse_execution_addresses(stderr_out)
-        exec_path = None
-        if addrs:
-            exec_path = _resolve_addresses_with_addr2line(binary_path, addrs)
-        return idx, exec_path
+        return idx, addrs
 
-    # 최대 8개 병렬 스레드로 Docker 실행 가속 (WSL2 Docker 기동 지연 극복)
-    resolved_paths = {}
+    raw_addr_results = {}
     if targets_to_run:
         with ThreadPoolExecutor(max_workers=8) as executor:
-            results = executor.map(_worker, targets_to_run)
-            for idx, exec_path in results:
-                if exec_path:
-                    resolved_paths[idx] = exec_path
+            results = executor.map(_run_worker, targets_to_run)
+            for idx, addrs in results:
+                if addrs:
+                    raw_addr_results[idx] = addrs
+
+    # Phase 2: 모든 시드의 주소를 합산 → 단일 addr2line 호출로 일괄 해석 (Docker 기동 1회)
+    all_unique_addrs = []
+    all_unique_addrs_set = set()
+    for addrs in raw_addr_results.values():
+        for a in addrs:
+            if a not in all_unique_addrs_set:
+                all_unique_addrs_set.add(a)
+                all_unique_addrs.append(a)
+
+    addr_to_symbol = {}
+    if all_unique_addrs and binary_path:
+        print(f"[Trace Optimizer] Batch-resolving {len(all_unique_addrs)} unique addresses in 1 Docker call")
+        symbols = _resolve_addresses_with_addr2line(binary_path, all_unique_addrs)
+        for i, addr in enumerate(all_unique_addrs):
+            if i < len(symbols):
+                addr_to_symbol[addr] = symbols[i]
+
+    # Phase 3: 각 시드별 실행 경로에 심볼 매핑
+    # (1) 파일 경로 기반 필터: /usr/, /repo/, /boost/, /include/
+    # (2) 함수명 기반 필터: std::, __gnu_cxx::, operator new 등 STL/컴파일러 런타임
+    # (3) 디버그 정보 없는 심볼 (??) → 사용자 코드는 반드시 디버그 정보가 있으므로 외부 코드로 간주
+    EXTERNAL_PATH_PATTERNS = ["/usr/", "/boost/", "/include/"]
+    EXTERNAL_FUNC_PATTERNS = [
+        "std::", "__gnu_cxx::", "__cxa", "__cxxabi", "operator new", "operator delete",
+        "__libc_", "_start", "numeric_limits", "initializer_list",
+        "boost::", "__gxx_personality", "_Unwind_",
+    ]
+
+    resolved_paths = {}
+    total_filtered_out = 0
+    for idx, addrs in raw_addr_results.items():
+        exec_path = []
+        filtered_count = 0
+        for a in addrs:
+            symbol = addr_to_symbol.get(a, a)
+            if not symbol or symbol == "??":
+                filtered_count += 1
+                continue
+            # 파일 경로 기반 필터
+            if any(p in symbol for p in EXTERNAL_PATH_PATTERNS):
+                filtered_count += 1
+                continue
+            # 함수명 자체가 해독 불가능한 경우만 제거 (함수명은 정상이지만 소스 파일 경로만 ??인 경우는 유지)
+            func_part = symbol.split(" (")[0] if " (" in symbol else symbol
+            if func_part.strip() == "??" or not func_part.strip():
+                filtered_count += 1
+                continue
+            # 함수명 기반 필터
+            func_name = symbol.split(" (")[0] if " (" in symbol else symbol
+            if any(pat in func_name for pat in EXTERNAL_FUNC_PATTERNS):
+                filtered_count += 1
+                continue
+            # 연속 중복 제거
+            if not exec_path or exec_path[-1] != symbol:
+                exec_path.append(symbol)
+
+        total_filtered_out += filtered_count
+
+        # ── Phase 3.5: 경로 간소화 (트리맵 가시성 향상) ──
+        # FuzzedDataProvider 내부 템플릿 함수들을 하나로 묶고, 긴 심볼명을 짧게 정리
+        if exec_path:
+            simplified = []
+            fdp_seen = False
+            for sym in exec_path:
+                # 함수명만 추출 (파일 경로 부분 제거)
+                func_name = sym.split(" (")[0] if " (" in sym else sym
+                # FuzzedDataProvider 내부 함수들을 하나의 노드로 압축
+                if "FuzzedDataProvider" in func_name:
+                    if not fdp_seen:
+                        simplified.append("FuzzedDataProvider")
+                        fdp_seen = True
+                    continue
+                fdp_seen = False
+                # 긴 템플릿 인자를 제거하여 함수명 간소화 (예: QuantLib::Handle<QuantLib::Quote>::Handle → Handle<Quote>::Handle)
+                short_name = func_name
+                # 네임스페이스는 마지막 클래스::함수만 유지
+                parts = short_name.split("::")
+                if len(parts) > 2:
+                    short_name = "::".join(parts[-2:])
+                simplified.append(short_name)
+            
+            if simplified:
+                resolved_paths[idx] = simplified
+
+    # ── 진단 로그: 필터링 결과 요약 ──
+    print(f"\n[Trace Diagnostics] ═══════════════════════════════════════════")
+    print(f"[Trace Diagnostics] Phase 3 Filtering Summary:")
+    print(f"  - Seeds with Docker traces (raw_addr_results): {len(raw_addr_results)}")
+    print(f"  - Seeds with surviving symbols (resolved_paths): {len(resolved_paths)}")
+    print(f"  - Total symbols filtered out: {total_filtered_out}")
+    for idx, path in list(resolved_paths.items())[:3]:  # 처음 3개 시드만 샘플 출력
+        print(f"  - Seed #{idx} surviving path ({len(path)} nodes): {' -> '.join(path[:5])}{'...' if len(path) > 5 else ''}")
 
     inserted: List[Tuple[int, str, int, str]] = []  # (trace_id, source, original_index, code_location)
 
     for idx, (raw_bytes, source) in enumerate(all_unique):
         execution_path_json = None
-        code_loc = f"afl_node_{idx}"
+        # Docker 실행 안 한 트레이스는 소스 타입(afl_queue/afl_crash/afl_hang)으로 그룹핑
+        # → 개별 afl_node_XX 대신 하나의 논리적 노드로 합쳐져 코너케이스 과다 판정 방지
+        code_loc = source
 
         exec_path = resolved_paths.get(idx)
         if exec_path:
@@ -281,14 +506,53 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
         stats["inserted"] += 1
         inserted.append((trace_id, source, idx, code_loc))
 
-    # ── 5. exec_frequency 계산 → 코너 케이스 분류 (T9) ────────────────────
-    dynamic_threshold = max(CORNER_CASE_THRESHOLD, 2.0 / total if total > 0 else 0)
+    # ── 5. 코드 위치별 실제 Hit Count 기반 빈도 계산 → 코너 케이스 분류 (T9) ──
+    total_unresolved_normal = sum(1 for _, _, _, loc in inserted if loc == "afl_queue")
+    total_resolved_normal = sum(1 for _, _, _, loc in inserted if loc not in ("afl_queue", "afl_crash", "afl_hang"))
+
+    denom_unresolved = total_unresolved_normal if total_unresolved_normal > 0 else 1
+    denom_resolved = total_resolved_normal if total_resolved_normal > 0 else 1
+
+    loc_hits = {}
+    for trace_id, source, idx, code_loc in inserted:
+        loc_hits[code_loc] = loc_hits.get(code_loc, 0) + 1
+
+    # 15% 이하로 실행된 희소한 제어 흐름 분기를 코너케이스로 판정
+    dynamic_threshold = 0.15
+
+    # ── 진단 로그: 빈도 분포표 ──
+    print(f"\n[Trace Diagnostics] Phase 5 Frequency Distribution:")
+    print(f"  - Total inserted traces: {len(inserted)}")
+    print(f"  - Resolved normal seeds (denom_resolved): {total_resolved_normal}")
+    print(f"  - Unresolved normal seeds (denom_unresolved): {total_unresolved_normal}")
+    print(f"  - Unique code locations: {len(loc_hits)}")
+    print(f"  - Corner case threshold: < {dynamic_threshold*100:.0f}%")
+    print(f"  - Frequency table:")
+    for loc, hits in sorted(loc_hits.items(), key=lambda x: x[1], reverse=True):
+        if loc in ("afl_queue", "afl_crash", "afl_hang"):
+            freq = hits / denom_unresolved
+            label = "UNRESOLVED"
+        else:
+            freq = hits / denom_resolved
+            label = "RESOLVED"
+        verdict = "CORNER CASE ❗" if freq < dynamic_threshold else "NORMAL ✅"
+        loc_short = loc[:80] + "..." if len(loc) > 80 else loc
+        print(f"    [{label}] {loc_short}  hits={hits}  freq={freq*100:.1f}%  → {verdict}")
 
     for trace_id, source, idx, code_loc in inserted:
         if source in ("afl_crash", "afl_hang"):
             exec_freq = CRASH_EXEC_FREQ
         else:
-            exec_freq = (total - idx) / total if total > 0 else 1.0
+            # 실측된 노드와 스킵된 대형 그룹에 대해 각각의 정밀 상대 비율 적용
+            if code_loc == "afl_queue":
+                exec_freq = loc_hits[code_loc] / denom_unresolved
+            else:
+                exec_freq = loc_hits[code_loc] / denom_resolved
+            
+            # 소수점 이하 가시성 보정
+            if exec_freq < 0.0001:
+                import random
+                exec_freq = 0.0001 + (random.random() * 0.0003)
 
         if exec_freq < dynamic_threshold:
             try:
@@ -299,8 +563,12 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
                     code_location=code_loc
                 )
                 stats["corner_cases"] += 1
-            except Exception:
+            except Exception as e:
+                print(f"[Corner Case Error] Failed to insert corner case: {e}")
                 stats["errors"] += 1
+
+    print(f"\n[Trace Diagnostics] Final Result: {stats['corner_cases']} corner cases found out of {len(inserted)} traces.")
+    print(f"[Trace Diagnostics] ═══════════════════════════════════════════\n")
 
     return stats
 

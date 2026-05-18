@@ -39,7 +39,9 @@ def compile_target(program_id, wait=False):
 def collect_traces(program_id, fuzz_seconds=60, wait=False):
     res_json = _make_request("GET", f"{API_BASE_URL}/target/{program_id}/traces", params={"fuzz_seconds": fuzz_seconds})
     if wait and res_json.get("task_id"):
-        return wait_for_task(res_json["task_id"], timeout=fuzz_seconds + 30)
+        # 실측 대상(최대 150개) 전체를 병렬 Docker로 돌리고 역해독 및 DB 적재하는 연산 시간을 고려하여 
+        # 타임아웃을 fuzz_seconds + 240초로 넉넉하게 확장합니다.
+        return wait_for_task(res_json["task_id"], timeout=fuzz_seconds + 240)
     return res_json
 
 def get_corner_cases(program_id):
@@ -76,10 +78,31 @@ def validate_mutant(mutant_id, wait=False):
         return wait_for_task(res_json["task_id"], timeout=120)
     return res_json
 
+def get_target_program(program_id):
+    return _make_request("GET", f"{API_BASE_URL}/target/{program_id}")
+
+def wait_for_github_import(program_id, timeout=600, interval=3):
+    """깃허브 임포트 백그라운드 태스크가 끝날 때(file_path가 pending이 아닐 때)까지 폴링 대기"""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        prog = get_target_program(program_id)
+        path = prog.get("file_path", "")
+        if path == "pending":
+            time.sleep(interval)
+            continue
+        elif path.startswith("error:"):
+            # 에러가 발생한 상황
+            err_reason = prog.get("original_code", "Unknown import pipeline error")
+            raise Exception(f"Github Import Failed:\n{err_reason}")
+        else:
+            # 성공적으로 임포트 완료
+            return prog
+    raise Exception(f"Github Import timed out after {timeout} seconds")
+
 def upload_github_target(repo_url, target_file):
     payload = {"repo_url": repo_url, "target_file": target_file}
-    # Github 클론/CMake는 동기 라우트이므로 매우 길게(최대 300초) 대기
-    return _make_request("POST", f"{API_BASE_URL}/target/github", json=payload, timeout=(10, 300))
+    # 백그라운드 처리로 바뀌어 응답 속도가 빠르므로 DEFAULT_REQ_TIMEOUT 사용
+    return _make_request("POST", f"{API_BASE_URL}/target/github", json=payload)
 
 def _run_pipeline_tail(prog_id):
     # 2. Compile
@@ -128,4 +151,7 @@ def run_full_pipeline(uploaded_files):
 def run_github_pipeline(repo_url, target_file):
     print(f"[Git] Importing {repo_url}...")
     res_upload = upload_github_target(repo_url, target_file)
-    return _run_pipeline_tail(res_upload["program_id"])
+    prog_id = res_upload["program_id"]
+    print(f"[Git] Waiting for background clone and compiles for program {prog_id}...")
+    wait_for_github_import(prog_id)
+    return _run_pipeline_tail(prog_id)

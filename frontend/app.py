@@ -3,7 +3,7 @@ import pandas as pd
 import requests
 from api_client import (
     upload_targets, compile_target, collect_traces, get_corner_cases, inject_mutation, 
-    upload_github_target, validate_mutant, get_trace_tree
+    upload_github_target, validate_mutant, get_trace_tree, wait_for_github_import
 )
 from components.trace_tree import render_trace_tree_and_table
 from components.diff_viewer import render_diff_viewer
@@ -111,9 +111,12 @@ def main() -> None:
                 st.session_state["validation_results"] = {}
                 try:
                     with st.status("Running FindAndFixMe Github Pipeline...", expanded=True) as status:
-                        st.write("Cloning repo and parsing CMake build system...")
+                        st.write("Cloning repo and compiling dependencies in background... (This may take a few minutes)")
                         res_upload = upload_github_target(repo_url, target_file)
                         prog_id = res_upload["program_id"]
+                        
+                        # Wait for the background compilation to finish successfully
+                        wait_for_github_import(prog_id)
                         
                         _run_pipeline_ui(prog_id, status, pattern_options, selected_pattern_id)
                 except requests.exceptions.HTTPError as e:

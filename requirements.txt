@@ -4,3 +4,4 @@ python-multipart
 streamlit
 requests
 google-generativeai
+streamlit-echarts

@@ -141,6 +141,18 @@ class TraceDBManager:
                 )
             ''')
 
+            # 6. DependencyCache (빌드 바이너리 캐시 트래커)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS DependencyCache (
+                    repo_url TEXT PRIMARY KEY,
+                    cache_key TEXT NOT NULL,
+                    cache_dir TEXT NOT NULL,
+                    linker_flags TEXT,
+                    apt_packages TEXT,
+                    last_built_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
             conn.commit()
 
     # ─────────────────────────────────────────────
@@ -220,6 +232,22 @@ class TraceDBManager:
         with get_db_connection(self.db_path) as conn:
             row = conn.execute("SELECT * FROM TargetProgram WHERE id=?", (program_id,)).fetchone()
             return dict(row) if row else None
+
+    def get_dependency_cache(self, repo_url: str) -> Optional[Dict]:
+        with get_db_connection(self.db_path) as conn:
+            row = conn.execute("SELECT * FROM DependencyCache WHERE repo_url=?", (repo_url,)).fetchone()
+            return dict(row) if row else None
+
+    def insert_or_update_dependency_cache(self, repo_url: str, cache_key: str, cache_dir: str, 
+                                          linker_flags: str, apt_packages: str) -> None:
+        with get_db_connection(self.db_path) as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO DependencyCache 
+                   (repo_url, cache_key, cache_dir, linker_flags, apt_packages, last_built_at) 
+                   VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (repo_url, cache_key, cache_dir, linker_flags, apt_packages)
+            )
+            conn.commit()
 
     def get_mutant(self, mutant_id: int) -> Optional[Dict]:
         with get_db_connection(self.db_path) as conn:

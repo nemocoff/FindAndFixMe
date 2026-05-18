@@ -185,7 +185,7 @@ public:
             Finder.addMatcher(
                 binaryOperator(isExpansionInMainFile(),
                                anyOf(hasOperatorName("<"), hasOperatorName("<=")),
-                               hasParent(forStmt())).bind("cwe193"),
+                               hasAncestor(forStmt())).bind("cwe193"),
                 &Callback);
 
         if (all || patternId == 3)

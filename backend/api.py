@@ -17,6 +17,8 @@ import tempfile
 import time
 import re
 import traceback
+import hashlib
+from datetime import datetime
 from typing import Optional, Dict
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
@@ -70,6 +72,21 @@ class MutationInjectRequest(BaseModel):
 class GithubTargetRequest(BaseModel):
     repo_url: str
     target_file: str
+    linker_flags: Optional[list[str]] = None
+    apt_packages: Optional[list[str]] = None
+
+
+def _find_library_dirs(build_dir_host: str) -> list[str]:
+    """build 디렉토리 하위에서 라이브러리 파일(.so, .a, .dylib)이 존재하는 모든 디렉토리 경로 추출"""
+    lib_dirs = set()
+    if not os.path.exists(build_dir_host):
+        return []
+    for root, _, files in os.walk(build_dir_host):
+        for f in files:
+            if f.endswith((".so", ".a", ".dylib")) or ".so." in f:
+                lib_dirs.add(root)
+                break
+    return list(lib_dirs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,12 +127,42 @@ def _run_cmd_in_docker(cmd: list, mounts: dict, env: dict = None, timeout: int =
     docker_cmd.append(DOCKER_IMAGE)
     docker_cmd.extend(cmd)
 
-    return subprocess.run(
-        docker_cmd,
-        input=stdin_data,
-        capture_output=True,
-        timeout=timeout
-    )
+    try:
+        return subprocess.run(
+            docker_cmd,
+            input=stdin_data,
+            capture_output=True,
+            timeout=timeout
+        )
+    except FileNotFoundError as e:
+        import sys, traceback
+        path_env = os.environ.get("PATH", "")
+        missing_exe = docker_cmd[0] if docker_cmd else "unknown"
+        detailed_err = (
+            f"\n[FileNotFoundError] 시스템 명령어 실행에 실패했습니다.\n"
+            f"==================================================\n"
+            f"▶ 실행 시도한 전체 커맨드: {docker_cmd}\n"
+            f"▶ 누락된 것으로 추정되는 바이너리: '{missing_exe}'\n"
+            f"▶ 현재 컨테이너 내부 가상 환경의 PATH 목록:\n{path_env}\n"
+            f"▶ Python 실행 경로: {sys.executable}\n"
+            f"▶ 상세 시스템 예외 메시지: {e}\n"
+            f"▶ 스택 트레이스:\n{traceback.format_exc()}"
+            f"==================================================\n"
+        )
+        print(detailed_err)
+        raise FileNotFoundError(detailed_err) from e
+    except Exception as e:
+        import traceback
+        detailed_err = (
+            f"\n[Unexpected Error in _run_cmd_in_docker] 서브프로세스 기동 중 알 수 없는 예외 발생\n"
+            f"==================================================\n"
+            f"▶ 실행 명령어: {docker_cmd}\n"
+            f"▶ 예외 유형: {type(e).__name__} - {e}\n"
+            f"▶ 스택 트레이스:\n{traceback.format_exc()}"
+            f"==================================================\n"
+        )
+        print(detailed_err)
+        raise Exception(detailed_err) from e
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -173,7 +220,20 @@ def _compile_regular(source_path: str, binary_path: str) -> str:
                 if flag and not flag.startswith("#"):
                     extra_flags.append(flag)
 
-    cmd = ["clang++", "-std=c++17", "-I/target", "-I/target/..", "-o", container_binary] + extra_flags + container_sources + ["-lQuantLib"]
+    include_flags = ["-I/target", "-I/target/.."]
+    linker_paths = []
+    repo_path_host = os.path.join(prog_dir_host, "repo")
+    if os.path.exists(repo_path_host):
+        include_flags.append("-I/target/repo")
+        # [자동화 일반화] 빌드된 모든 라이브러리 디렉토리를 동적으로 추적하여 링커 경로에 추가
+        build_path_host = os.path.join(repo_path_host, "build")
+        if os.path.exists(build_path_host):
+            for lib_dir_host in _find_library_dirs(build_path_host):
+                rel_path = os.path.relpath(lib_dir_host, repo_path_host)
+                container_lib_dir = os.path.join("/target/repo", rel_path).replace("\\", "/")
+                linker_paths.extend([f"-L{container_lib_dir}", f"-Wl,-rpath,{container_lib_dir}"])
+ 
+    cmd = ["clang++", "-std=c++17"] + include_flags + linker_paths + ["-o", container_binary] + extra_flags + container_sources
     result = _run_cmd_in_docker(cmd, mounts=mounts, timeout=300)
     err_str = result.stderr.decode('utf-8', errors='ignore') if isinstance(result.stderr, bytes) else str(result.stderr)
     return err_str if result.returncode != 0 else ""
@@ -217,7 +277,20 @@ def _compile_afl(source_path: str, afl_binary_path: str) -> str:
                 if flag and not flag.startswith("#"):
                     extra_flags.append(flag)
 
-    cmd = ["afl-clang-fast++", "-std=c++17", "-I/target", "-I/target/..", "-o", container_binary] + extra_flags + container_sources + ["-lQuantLib"]
+    include_flags = ["-I/target", "-I/target/.."]
+    linker_paths = []
+    repo_path_host = os.path.join(prog_dir_host, "repo")
+    if os.path.exists(repo_path_host):
+        include_flags.append("-I/target/repo")
+        # [자동화 일반화] 빌드된 모든 라이브러리 디렉토리를 동적으로 추적하여 링커 경로에 추가
+        build_path_host = os.path.join(repo_path_host, "build")
+        if os.path.exists(build_path_host):
+            for lib_dir_host in _find_library_dirs(build_path_host):
+                rel_path = os.path.relpath(lib_dir_host, repo_path_host)
+                container_lib_dir = os.path.join("/target/repo", rel_path).replace("\\", "/")
+                linker_paths.extend([f"-L{container_lib_dir}", f"-Wl,-rpath,{container_lib_dir}"])
+ 
+    cmd = ["afl-clang-fast++", "-std=c++17"] + include_flags + linker_paths + ["-o", container_binary] + extra_flags + container_sources
     result = _run_cmd_in_docker(cmd, mounts=mounts, timeout=300)
     err_str = result.stderr.decode('utf-8', errors='ignore') if isinstance(result.stderr, bytes) else str(result.stderr)
     return err_str if result.returncode != 0 else ""
@@ -241,8 +314,16 @@ def _run_afl_docker(program_id: int, afl_binary_path: str, afl_out_dir: str, tim
     os.makedirs(afl_out_dir_host, exist_ok=True)
 
     if not os.listdir(seed_dir_host):
-        with open(os.path.join(seed_dir_host, "seed0"), "wb") as f:
-            f.write(b"\x00" * 8)
+        binary_name = os.path.basename(binary_path_host).lower()
+        if "americanoption" in binary_name or "quantlib" in binary_path_host.lower():
+            import struct
+            # length=1 (uint16), type=1 (uint8, Call), strike=100.0, s=100.0, q=0.01, r=0.03, t=1.0, v=0.2 (doubles)
+            seed_data = struct.pack("<H B d d d d d d", 1, 1, 100.0, 100.0, 0.01, 0.03, 1.0, 0.2)
+            with open(os.path.join(seed_dir_host, "seed0"), "wb") as f:
+                f.write(seed_data)
+        else:
+            with open(os.path.join(seed_dir_host, "seed0"), "wb") as f:
+                f.write(b"\x00" * 8)
 
     mounts = {
         prog_dir_host: "/target",
@@ -318,21 +399,34 @@ async def init_target(files: list[UploadFile] = File(...)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/v1/target/github")
-async def init_target_github(req: GithubTargetRequest):
-    if not is_safe_github_url(req.repo_url):
-        raise HTTPException(status_code=400, detail="Invalid GitHub URL format.")
+@app.get("/api/v1/target/{program_id}")
+async def get_target_program(program_id: int):
+    program = db.get_program(program_id)
+    if not program:
+        raise HTTPException(status_code=404, detail="Program not found.")
+    return {
+        "id": program["id"],
+        "file_path": program["file_path"],
+        "original_code": program["original_code"],
+        "binary_path": program.get("binary_path"),
+        "afl_binary_path": program.get("afl_binary_path")
+    }
 
+
+def _bg_init_target_github(program_id: int, req: GithubTargetRequest):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO TargetProgram (file_path, original_code) VALUES (?, ?)", ("pending", "github_import"))
-            program_id = cursor.lastrowid
-            conn.commit()
-
         repo_name_raw = req.repo_url.rstrip("/").split("/")[-1].replace(".git", "")
         project_dir_name = f"{repo_name_raw}_{program_id}"
         prog_dir = os.path.join(TEMP_TARGETS_DIR, project_dir_name)
+        if os.path.lexists(prog_dir):
+            try:
+                if os.path.isdir(prog_dir) and not os.path.islink(prog_dir):
+                    import shutil
+                    shutil.rmtree(prog_dir)
+                else:
+                    os.remove(prog_dir)
+            except Exception as e:
+                print(f"[Cleanup Warning] Failed to remove conflicting target path: {e}")
         os.makedirs(prog_dir, exist_ok=True)
         repo_dir = os.path.join(prog_dir, "repo")
 
@@ -344,10 +438,16 @@ async def init_target_github(req: GithubTargetRequest):
         except subprocess.TimeoutExpired:
             raise Exception("Git Clone timed out after 300 seconds.")
 
+        # [자동화] 동적 apt 패키지 설치 처리 (분석할 오픈소스 맞춤 디펜던시)
+        if req.apt_packages:
+            print(f"[Docker Sandbox] Dynamically installing developer packages: {req.apt_packages}...")
+            _run_cmd_in_docker(["apt-get", "update"], mounts=None, network="bridge", timeout=120)
+            _run_cmd_in_docker(["apt-get", "install", "-y"] + req.apt_packages, mounts=None, network="bridge", timeout=300)
+
         build_dir = os.path.join(repo_dir, "build")
         os.makedirs(build_dir, exist_ok=True)
-        print(f"[CMake] Configuring {req.repo_url} in Docker Sandbox...")
-        
+
+        print(f"[CMake] Configuring {req.repo_url} in Docker Sandbox for compilation flags extraction...")
         cmake_mounts = {os.path.abspath(repo_dir): "/repo"}
         try:
             cmake_res = _run_cmd_in_docker(
@@ -377,9 +477,13 @@ async def init_target_github(req: GithubTargetRequest):
                                 flags.append(f"-I{parts[i+1]}")
                         break
         
-        repo_name = req.repo_url.split("/")[-1].replace(".git", "").lower()
-        if "quantlib" in repo_name: flags.append("-lQuantLib")
-        elif "openssl" in repo_name: flags.extend(["-lssl", "-lcrypto"])
+        # [자동화] 동적 링커 플래그 주입 처리
+        if req.linker_flags:
+            flags.extend(req.linker_flags)
+        else:
+            repo_name = req.repo_url.split("/")[-1].replace(".git", "").lower()
+            if "quantlib" in repo_name: flags.append("-lQuantLib")
+            elif "openssl" in repo_name: flags.extend(["-lssl", "-lcrypto"])
 
         flags_file = os.path.join(prog_dir, "compile_flags.txt")
         with open(flags_file, "w") as f:
@@ -404,11 +508,38 @@ async def init_target_github(req: GithubTargetRequest):
             except Exception: pass
             conn.execute("UPDATE TargetProgram SET source_file_path=? WHERE id=?", (target_abs, program_id))
             conn.commit()
-
-        return {"status": "success", "program_id": program_id, "flags_extracted": len(flags)}
+            
+        print(f"[Git Target] Target initialization completed successfully for program_id: {program_id}")
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Github Import Failed: {str(e)}")
+        # Mark target as error so that UI can detect and notify the user
+        with get_db_connection() as conn:
+            conn.execute(
+                "UPDATE TargetProgram SET file_path=?, original_code=? WHERE id=?", 
+                (f"error: {str(e)}", f"Github Import Pipeline Failed:\n{str(e)}", program_id)
+            )
+            conn.commit()
+
+
+@app.post("/api/v1/target/github")
+async def init_target_github(req: GithubTargetRequest, background_tasks: BackgroundTasks):
+    if not is_safe_github_url(req.repo_url):
+        raise HTTPException(status_code=400, detail="Invalid GitHub URL format.")
+
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO TargetProgram (file_path, original_code) VALUES (?, ?)", ("pending", "github_import"))
+            program_id = cursor.lastrowid
+            conn.commit()
+
+        # Run heavy clone, CMake config, and dependency make in background thread
+        background_tasks.add_task(_bg_init_target_github, program_id, req)
+
+        return {"status": "success", "program_id": program_id, "message": "Import pipeline initiated in background."}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to submit import task: {str(e)}")
 
 
 @app.post("/api/v1/target/{program_id}/compile")
@@ -557,10 +688,73 @@ async def inject_mutation(req: MutationInjectRequest, background_tasks: Backgrou
             result = _perform_injection(req)
             TASK_STATUS[task_id] = {"status": "completed", "result": result}
         except Exception as e:
-            TASK_STATUS[task_id] = {"status": "failed", "error": str(e)}
+            import traceback
+            tb_str = traceback.format_exc()
+            print(f"[Inject Task Exception] Critical background failure:\n{tb_str}")
+            detailed_err = (
+                f"백그라운드 결함 주입 중 치명적인 예외가 발생했습니다.\n"
+                f"==================================================\n"
+                f"▶ 예외 종류: {type(e).__name__}\n"
+                f"▶ 에러 메시지: {e}\n"
+                f"▶ 호출된 엔드포인트: POST /api/v1/mutations/inject\n"
+                f"▶ 요청 노드 ID: {req.node_id}\n"
+                f"▶ 요청 패턴 ID: {req.pattern_id}\n\n"
+                f"[시스템 상세 스택 트레이스]:\n{tb_str}"
+                f"==================================================\n"
+            )
+            TASK_STATUS[task_id] = {"status": "failed", "error": detailed_err}
 
     background_tasks.add_task(_inject_task)
     return {"status": "accepted", "task_id": task_id}
+
+
+def normalize_project_relative_path(path_str: str, base_dir: str) -> str:
+    """
+    윈도우 절대 경로, 리눅스 절대 경로, WSL 마운트 경로(/mnt/c/...) 등 
+    그 어떤 형태의 경로가 들어와도 프로젝트 루트(base_dir) 기준의 순수한 상대 경로로 정규화합니다.
+    """
+    p = path_str.replace("\\", "/").strip()
+    base = base_dir.replace("\\", "/").strip()
+    
+    if p.startswith("/mnt/"):
+        parts = p.split("/")
+        if len(parts) > 2:
+            p = f"{parts[2]}:/" + "/".join(parts[3:])
+            
+    if base.startswith("/mnt/"):
+        parts = base.split("/")
+        if len(parts) > 2:
+            base = f"{parts[2]}:/" + "/".join(parts[3:])
+            
+    if len(p) > 1 and p[1] == ":":
+        p = p[0].lower() + p[1:]
+    if len(base) > 1 and base[1] == ":":
+        base = base[0].lower() + base[1:]
+        
+    if p.startswith(base):
+        return p[len(base):].lstrip("/")
+        
+    if "temp_targets/" in p:
+        idx = p.find("temp_targets/")
+        return p[idx:]
+        
+    # [CWD 미아 영구 방어막]
+    # os.path.relpath는 내부적으로 os.getcwd()를 조회하므로, 임시폴더 삭제 등으로 CWD가 미아가 되면
+    # FileNotFoundError 가 발생합니다. 이를 완벽하게 우회하는 순수 인메모리 경로 상대화 로직을 이식합니다.
+    p_norm = p.lower()
+    base_norm = base.lower()
+    if p_norm.startswith(base_norm):
+        return p[len(base):].lstrip("/").replace("\\", "/")
+        
+    try:
+        return os.path.relpath(path_str, base_dir).replace("\\", "/")
+    except Exception:
+        # 시스템 CWD가 소실되었을 때의 철통 방어 fallback
+        for token in ["temp_targets", "backend", "core"]:
+            if token in p:
+                idx = p.find(token)
+                return p[idx:]
+        return os.path.basename(path_str)
 
 
 def _perform_injection(req: MutationInjectRequest):
@@ -598,29 +792,94 @@ def _perform_injection(req: MutationInjectRequest):
     patterns = [req.pattern_id] if req.pattern_id != 0 else list(PATTERN_REGISTRY.keys())
     successful_pattern, mutated_code, mutations = None, "", []
 
+    # compile_flags.txt 에서 컴파일 include/define 플래그들을 추출하여 Clang AST 분석 인자로 전달
+    compile_args = []
+    flags_file = os.path.join(os.path.dirname(source_path), "compile_flags.txt")
+    if os.path.exists(flags_file):
+        with open(flags_file, "r") as f:
+            for line in f:
+                flag = line.strip()
+                if flag and not flag.startswith("-l"):
+                    compile_args.append(flag)
+
+    # 도커 샌드박스의 핵심 시스템 의존성 헤더 기본 탑재 (QuantLib, Boost 헤더 해석 보장)
+    compile_args.extend([
+        "-I/usr/local/include",
+        "-I/usr/include",
+        "-I/usr/include/boost"
+    ])
+
+    last_error_detail = ""
+    # MutationEngine 은 libclang-cpp.so.16 의존성이 있으므로 LLVM 16이 없는 backend 대신 sandbox 내부에서 안전하게 실행함.
+    # [플랫폼 독립적 완벽 경로 매핑] normalize_project_relative_path 를 통해 모든 하이브리드 경로 완전 극복
+    rel_source = normalize_project_relative_path(source_path, BASE_DIR)
+    container_source_path = f"/app/{rel_source}"
+    
+    rel_engine = normalize_project_relative_path(MUTATION_ENGINE_BIN, BASE_DIR)
+    container_engine_bin = f"/app/{rel_engine}"
+    
+    # 컴파일 인자 중 호스트 상의 절대 경로를 컨테이너 내부 /app 경로로 일괄 매핑
+    container_compile_args = []
+    for arg in compile_args:
+        rel_arg = normalize_project_relative_path(arg, BASE_DIR)
+        if "temp_targets/" in rel_arg or "core/" in rel_arg:
+            container_compile_args.append(f"/app/{rel_arg}")
+        else:
+            container_compile_args.append(arg.replace("\\", "/"))
+
+    mounts = { os.path.abspath(BASE_DIR): "/app" }
+
     for pid in patterns:
         try:
-            res = _run_subprocess([MUTATION_ENGINE_BIN, source_path, f"--pattern-id={pid}", "--"], timeout=30)
-            if res.returncode == 0:
-                output = json.loads(res.stdout)
-                m_code, m_list = output.get("mutated_code", ""), output.get("mutations", [])
-                if m_code and m_code.strip() != original_code.strip():
-                    successful_pattern, mutated_code, mutations = pid, m_code, m_list
-                    req.pattern_id = pid
-                    break
-        except: continue
+            cmd = [container_engine_bin, container_source_path, f"--pattern-id={pid}", "--"] + container_compile_args
+            print(f"[Mutation Trace] Executing MutationEngine inside Sandbox: {' '.join(cmd)}")
+            res = _run_cmd_in_docker(cmd, mounts=mounts, network="bridge", timeout=30)
+            
+            stdout_str = res.stdout.decode('utf-8', errors='ignore') if isinstance(res.stdout, bytes) else str(res.stdout)
+            stderr_str = res.stderr.decode('utf-8', errors='ignore') if isinstance(res.stderr, bytes) else str(res.stderr)
+            
+            if res.returncode != 0:
+                print(f"[Mutation Warning] MutationEngine exited with code {res.returncode}.\nStderr: {stderr_str}\nStdout: {stdout_str}")
+                last_error_detail = f"ExitCode: {res.returncode}\nStderr: {stderr_str[:500]}"
+                continue
+                
+            try:
+                output = json.loads(stdout_str)
+            except json.JSONDecodeError as je:
+                print(f"[Mutation Error] Failed to parse JSON. Stdout was:\n{stdout_str}\nError: {je}")
+                last_error_detail = f"JSON Parse Error. Stdout: {stdout_str[:300]}"
+                continue
+                
+            m_code, m_list = output.get("mutated_code", ""), output.get("mutations", [])
+            if m_code and m_code.strip() != original_code.strip():
+                successful_pattern, mutated_code, mutations = pid, m_code, m_list
+                req.pattern_id = pid
+                break
+            else:
+                last_error_detail = "Generated code was identical to original code (No mutations matched)."
+        except Exception as e:
+            import traceback
+            tb_str = traceback.format_exc()
+            print(f"[Mutation Exception] Unexpected failure:\n{tb_str}")
+            last_error_detail = f"오류 유형: {type(e).__name__}\n상세 에러: {e}\n\n[파이썬 스택 트레이스]:\n{tb_str}"
+            continue
 
-    if not successful_pattern: raise Exception("주입 가능한 취약점 패턴 미발견")
+    if not successful_pattern: raise Exception(f"주입 가능한 취약점 패턴 미발견\n[에러 상세]:\n{last_error_detail}")
 
     mutant_binary_path = ""
-    mutant_src = os.path.join(os.path.dirname(source_path), f"{os.path.splitext(os.path.basename(source_path))[0]}_mutant.cpp")
+    # DB에 들어있던 Linux 형태의 하이브리드 경로들을 윈도우 호스트가 안전하게 쓸 수 있는 물리적 절대 경로로 복구
+    host_source_path = os.path.abspath(os.path.join(BASE_DIR, rel_source))
+    host_source_file_path = os.path.abspath(os.path.join(BASE_DIR, normalize_project_relative_path(source_file_path, BASE_DIR))) if source_file_path else host_source_path
+
+    mutant_src = os.path.join(os.path.dirname(host_source_path), f"{os.path.splitext(os.path.basename(host_source_path))[0]}_mutant.cpp")
 
     with open(mutant_src, "w", encoding="utf-8") as f: f.write(mutated_code)
-    if source_file_path and os.path.exists(os.path.dirname(source_file_path)):
-        with open(source_file_path, "w", encoding="utf-8") as f: f.write(mutated_code)
+    if host_source_file_path and os.path.exists(os.path.dirname(host_source_file_path)):
+        with open(host_source_file_path, "w", encoding="utf-8") as f: f.write(mutated_code)
 
     try:
         mutant_bin = mutant_src.replace(".cpp", "")
+        # 컴파일러도 호스트에 알맞게 정규화된 소스 코드 경로를 통해 빌드 수행
         if not _compile_regular(mutant_src, mutant_bin): mutant_binary_path = mutant_bin
     except: pass
 
