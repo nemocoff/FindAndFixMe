@@ -30,13 +30,7 @@ def main() -> None:
         6: "CWE-401 Memory Leak"
     }
     # 결함 주입 설정: 100% 자동 탐지 모드로 고정
-    # selected_pattern_id = 0
-    # UI에 패턴 선택 드롭다운 메뉴를 생성합니다!
-    selected_pattern_id = st.selectbox(
-        "Select Mutation Pattern", 
-        options=list(pattern_options.keys()), 
-        format_func=lambda x: pattern_options[x]
-    )
+    selected_pattern_id = 0
     
     if "analysis_result" not in st.session_state:
         st.session_state["analysis_result"] = None

@@ -8,7 +8,7 @@ sudo apt-get install -y cmake build-essential python3-dev libzstd-dev libcurl4-o
 sudo apt-get install -y llvm-16 clang-16 libclang-16-dev
 sudo apt-get install -y libz3-dev z3
 sudo apt-get install -y afl++
-# sudo apt-get install -y libquantlib0-dev # quantlib library test
+sudo apt-get install -y libquantlib0-dev # quantlib library test
 
 # 2. Python Dependencies
 echo "Installing Python API & Frontend Dependencies..."
