@@ -421,7 +421,6 @@ def _bg_init_target_github(program_id: int, req: GithubTargetRequest):
         if os.path.lexists(prog_dir):
             try:
                 if os.path.isdir(prog_dir) and not os.path.islink(prog_dir):
-                    import shutil
                     shutil.rmtree(prog_dir)
                 else:
                     os.remove(prog_dir)
