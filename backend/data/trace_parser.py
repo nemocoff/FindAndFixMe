@@ -733,38 +733,42 @@ def build_trace_tree(program_id: int, db: TraceDBManager) -> Dict[str, Any]:
             else:
                 path.append(f"Normal Path {t_id}")
 
+        # 이 트레이스가 코너케이스인지 여부
+        is_cc_trace = t_id in cc_map
+        last_step_idx = len(path) - 1
+
         # 경로를 트리에 병합
         current = root
-        for step in path:
+        for step_idx, step in enumerate(path):
+            is_last_step = (step_idx == last_step_idx)
             found = False
             for child in current["children"]:
                 if child["name"] == step:
                     child["hit_count"] += 1
-                    # 만약 이 기존 노드가 이번 트레이스에서 코너케이스 지점이라면 코너케이스 플래그 및 메타데이터 업데이트!
-                    if t_id in cc_map and step == cc_map[t_id]["code_location"]:
+                    # 코너케이스 트레이스의 마지막 스텝(종착 노드)에 플래그 부여
+                    if is_cc_trace and is_last_step:
                         child["is_corner_case"] = True
-                        child["code_snippet"] = f"// Vulnerability candidate at {step}\n// Execution frequency: {cc_map[t_id]['exec_frequency']:.6f}"
-                        child["frequency"] = cc_map[t_id]["exec_frequency"]
+                        cc_info = cc_map[t_id]
+                        child["code_snippet"] = f"// Corner case divergence point\n// Execution frequency: {cc_info['exec_frequency']:.6f}\n// Path: {cc_info['code_location']}"
+                        child["frequency"] = cc_info["exec_frequency"]
                     current = child
                     found = True
                     break
             
             if not found:
-                is_cc = False
-                if t_id in cc_map:
-                    # 코너케이스 여부 확인: 현재 노드가 해당 트레이스 코너케이스의 code_location이거나 마지막 스텝인 경우
-                    is_cc = (step == cc_map[t_id]["code_location"])
+                is_cc_node = is_cc_trace and is_last_step
 
                 new_node = {
                     "name": step,
                     "node_id": f"node_{t_id}_{step}",
                     "hit_count": 1,
-                    "is_corner_case": is_cc,
+                    "is_corner_case": is_cc_node,
                     "children": []
                 }
-                if is_cc:
-                    new_node["code_snippet"] = f"// Vulnerability candidate at {step}\n// Execution frequency: {cc_map[t_id]['exec_frequency']:.6f}"
-                    new_node["frequency"] = cc_map[t_id]["exec_frequency"]
+                if is_cc_node:
+                    cc_info = cc_map[t_id]
+                    new_node["code_snippet"] = f"// Corner case divergence point\n// Execution frequency: {cc_info['exec_frequency']:.6f}\n// Path: {cc_info['code_location']}"
+                    new_node["frequency"] = cc_info["exec_frequency"]
                 
                 current["children"].append(new_node)
                 current = new_node
