@@ -378,6 +378,7 @@ async def init_target(files: list[UploadFile] = File(...)):
         os.makedirs(prog_dir, exist_ok=True)
         
         primary_file_path = ""
+        primary_content = ""
         for file in files:
             safe_name = os.path.basename(file.filename)
             file_path = os.path.join(prog_dir, safe_name)
@@ -386,11 +387,14 @@ async def init_target(files: list[UploadFile] = File(...)):
                 f.write(content)
             if not primary_file_path and safe_name.endswith((".cpp", ".cc", ".cxx")):
                 primary_file_path = file_path
+                primary_content = content.decode("utf-8", errors="replace")
 
         with get_db_connection() as conn:
             conn.execute(
-                "UPDATE TargetProgram SET file_path=? WHERE id=?",
-                (primary_file_path or os.path.join(prog_dir, files[0].filename), program_id)
+                "UPDATE TargetProgram SET file_path=?, original_code=? WHERE id=?",
+                (primary_file_path or os.path.join(prog_dir, files[0].filename),
+                 primary_content or "multiple_files",
+                 program_id)
             )
             conn.commit()
 
