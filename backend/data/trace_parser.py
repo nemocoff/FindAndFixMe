@@ -166,10 +166,9 @@ def _run_binary_in_docker(binary_path: str, stdin_data: bytes) -> str:
         else:
             print("[Trace Capture] WARNING: stderr is completely empty! Execution didn't log [ENTER] addresses.")
             
-        return stderr_str
+        return stderr_str, res.returncode
     except Exception as e:
-        print(f"[Trace Capture Exception] Critical error running binary inside container: {e}")
-        return ""
+        print(f"[Trace Capture] Error running binary: {e}")
     finally:
         if temp_seed_host and os.path.exists(temp_seed_host):
             try:
@@ -177,6 +176,7 @@ def _run_binary_in_docker(binary_path: str, stdin_data: bytes) -> str:
                 print(f"[Trace Capture] Safely cleaned up temporary seed: {temp_seed_host}")
             except:
                 pass
+    return "", -1
 
 
 def _parse_execution_addresses(stderr_output: str) -> List[str]:
@@ -381,15 +381,17 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
     # Phase 1: 바이너리 실행 (병렬) → 함수 주소만 수집 (addr2line은 아직 안 함)
     def _run_worker(item):
         idx, raw_bytes, source = item
-        stderr_out = _run_binary_in_docker(binary_path, raw_bytes)
+        stderr_out, returncode = _run_binary_in_docker(binary_path, raw_bytes)
         addrs = _parse_execution_addresses(stderr_out)
-        return idx, addrs
+        return idx, addrs, returncode
 
     raw_addr_results = {}
+    return_codes = {}  # idx → subprocess return code (0=normal, 128+N=signal N)
     if targets_to_run:
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = executor.map(_run_worker, targets_to_run)
-            for idx, addrs in results:
+            for idx, addrs, rc in results:
+                return_codes[idx] = rc
                 if addrs:
                     raw_addr_results[idx] = addrs
 
@@ -502,13 +504,21 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
 
         exec_path = resolved_paths.get(idx)
         if exec_path:
+            # [핵심 개선] 프로세스 리턴 코드(크래시 시그널)를 경로에 반영
+            # 같은 함수를 호출하더라도, 크래시(return code 128+N) vs 정상(0)은 근본적으로 다른 실행
+            rc = return_codes.get(idx, 0)
+            if rc > 128:
+                signal_num = rc - 128
+                signal_names = {6: 'SIGABRT', 8: 'SIGFPE', 11: 'SIGSEGV', 9: 'SIGKILL'}
+                sig_label = signal_names.get(signal_num, f'SIG{signal_num}')
+                exec_path = exec_path + [f'CRASH({sig_label})']
+            elif rc != 0 and rc != -1:
+                exec_path = exec_path + [f'EXIT({rc})']
+
             execution_path_json = json.dumps(exec_path)
-            # [핵심 개선] 실행 경로 전체의 고유 핑거프린트를 code_loc으로 사용
-            # 마지막 함수명만 사용하면 동일한 함수에서 끝나는 완전히 다른 경로가 하나로 뭉개짐
-            # → 경로 깊이 + 마지막 의미있는 함수로 고유한 경로 서명 생성
+            # 실행 경로 전체의 고유 핑거프린트를 code_loc으로 사용
             path_sig = "|".join(exec_path)
             path_hash = hashlib.md5(path_sig.encode()).hexdigest()[:8]
-            # 사람이 읽을 수 있는 레이블: "depth=11 @ QL::Quote::Quote"
             last_meaningful = exec_path[-1]
             code_loc = f"path_{path_hash}_depth{len(exec_path)}_{last_meaningful}"
 
