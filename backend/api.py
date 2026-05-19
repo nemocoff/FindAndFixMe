@@ -832,6 +832,13 @@ def _perform_injection(req: MutationInjectRequest):
 
     mounts = { os.path.abspath(BASE_DIR): "/app" }
 
+    # [핵심 변경] Auto Detect(pattern_id=0)일 때 모든 매칭 패턴을 순차 적용
+    # 각 패턴의 출력이 다음 패턴의 입력이 되어 CWE-190 + CWE-193이 동시에 주입됩니다
+    all_mutations = []
+    all_successful_patterns = []
+    working_code = original_code  # 현재 작업 중인 코드 (패턴마다 갱신)
+    host_source_path_resolved = os.path.abspath(os.path.join(BASE_DIR, rel_source))
+
     for pid in patterns:
         try:
             cmd = [container_engine_bin, container_source_path, f"--pattern-id={pid}", "--"] + container_compile_args
@@ -854,12 +861,20 @@ def _perform_injection(req: MutationInjectRequest):
                 continue
                 
             m_code, m_list = output.get("mutated_code", ""), output.get("mutations", [])
-            if m_code and m_code.strip() != original_code.strip():
-                successful_pattern, mutated_code, mutations = pid, m_code, m_list
-                req.pattern_id = pid
-                break
+            if m_code and m_code.strip() != working_code.strip():
+                all_successful_patterns.append(pid)
+                all_mutations.extend(m_list)
+                working_code = m_code
+                # 다음 패턴이 이 결과 위에서 작업하도록 소스 파일 갱신
+                if os.path.exists(host_source_path_resolved):
+                    with open(host_source_path_resolved, "w", encoding="utf-8") as f:
+                        f.write(working_code)
+                print(f"[Mutation Success] Pattern {pid} ({PATTERN_REGISTRY.get(pid, '?')}) applied! Total mutations so far: {len(all_mutations)}")
+                # Auto Detect가 아니면 첫 성공에서 멈춤 (특정 패턴 지정 시)
+                if req.pattern_id != 0:
+                    break
             else:
-                last_error_detail = "Generated code was identical to original code (No mutations matched)."
+                last_error_detail = "Generated code was identical to working code (No mutations matched)."
         except Exception as e:
             import traceback
             tb_str = traceback.format_exc()
@@ -867,7 +882,20 @@ def _perform_injection(req: MutationInjectRequest):
             last_error_detail = f"오류 유형: {type(e).__name__}\n상세 에러: {e}\n\n[파이썬 스택 트레이스]:\n{tb_str}"
             continue
 
-    if not successful_pattern: raise Exception(f"주입 가능한 취약점 패턴 미발견\n[에러 상세]:\n{last_error_detail}")
+    # 원본 소스 파일 복원 (체이닝 과정에서 덮어썼으므로)
+    if os.path.exists(host_source_path_resolved) and all_successful_patterns:
+        with open(host_source_path_resolved, "w", encoding="utf-8") as f:
+            f.write(original_code)
+
+    if not all_successful_patterns:
+        raise Exception(f"주입 가능한 취약점 패턴 미발견\n[에러 상세]:\n{last_error_detail}")
+
+    successful_pattern = all_successful_patterns[0]
+    mutated_code = working_code
+    mutations = all_mutations
+    # 적용된 패턴들의 이름을 결합 (예: "CWE-190 Integer Overflow + CWE-193 Boundary Condition Error")
+    combined_pattern_name = " + ".join(PATTERN_REGISTRY.get(p, f"Pattern-{p}") for p in all_successful_patterns)
+    req.pattern_id = all_successful_patterns[0]  # DB 저장용 (첫 번째 패턴 ID)
 
     mutant_binary_path = ""
     # DB에 들어있던 Linux 형태의 하이브리드 경로들을 윈도우 호스트가 안전하게 쓸 수 있는 물리적 절대 경로로 복구
@@ -890,7 +918,7 @@ def _perform_injection(req: MutationInjectRequest):
     return {
         "status": "success", 
         "mutant_id": mutant_id, 
-        "pattern_name": PATTERN_REGISTRY.get(req.pattern_id, "Unknown"),
+        "pattern_name": combined_pattern_name,
         "original_code": original_code,
         "mutated_code": mutated_code,
         "mutations_applied": mutations, 
