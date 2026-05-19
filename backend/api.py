@@ -764,55 +764,56 @@ def _perform_injection(req: MutationInjectRequest):
     actual_node_id: Optional[int] = None
     row = None
     target_func = ""
-    try:
-        with get_db_connection() as conn:
-            row = conn.execute(
-                """SELECT t.id as program_id, t.file_path, t.original_code, t.source_file_path, c.code_location, d.execution_path
-                   FROM TargetProgram t
-                   JOIN DynamicTrace d ON d.program_id = t.id
-                   JOIN CornerCaseNode c ON c.trace_id = d.id
-                   WHERE c.id = ?""", (req.node_id,)
-            ).fetchone()
-        if row: 
-            actual_node_id = req.node_id
-            
-            # 1. execution_path 역추적을 통한 타겟 함수명 추출 (CRASH/EXIT 노드 우회)
-            import json
-            try:
-                exec_path = json.loads(row["execution_path"]) if row["execution_path"] else []
-            except Exception:
-                exec_path = []
-                
-            found_func = None
-            if exec_path:
-                for node in reversed(exec_path):
-                    node_clean = node.strip()
-                    if (node_clean.startswith("CRASH(") or 
-                        node_clean.startswith("EXIT(") or 
-                        node_clean in ("LLVMFuzzerTestOneInput", "FuzzedDataProvider")):
-                        continue
-                    
-                    # 함수 시그니처에서 베이스 함수명만 안전하게 파싱 (예: QL::Quote::value(...) -> value)
-                    func_name = node_clean.split("(")[0].split("::")[-1].strip()
-                    if func_name:
-                        found_func = func_name
-                        break
-            
-            if found_func:
-                target_func = found_func
-                print(f"[Mutation Trace] Found target function via execution_path traceback: {target_func}")
-            else:
-                # 2. 실패 시 기존 code_location 기반 파싱 Fallback
-                code_loc = row["code_location"]
-                if code_loc and "_depth" in code_loc:
-                    parts = code_loc.split("_depth")[-1].split("_", 1)
-                    if len(parts) > 1:
-                        func_with_args = parts[1]
-                        target_func = func_with_args.split("(")[0].split("::")[-1].strip()
-                        print(f"[Mutation Trace] Fallback to target function via code_location: {target_func}")
-    except Exception as e:
-        print(f"[Mutation Error] Failed to extract target function: {e}")
-        pass
+    # 임시 주석 처리: 파일 내의 모든 위치에 결함을 주입하도록 설정
+    # try:
+    #     with get_db_connection() as conn:
+    #         row = conn.execute(
+    #             """SELECT t.id as program_id, t.file_path, t.original_code, t.source_file_path, c.code_location, d.execution_path
+    #                FROM TargetProgram t
+    #                JOIN DynamicTrace d ON d.program_id = t.id
+    #                JOIN CornerCaseNode c ON c.trace_id = d.id
+    #                WHERE c.id = ?""", (req.node_id,)
+    #         ).fetchone()
+    #     if row: 
+    #         actual_node_id = req.node_id
+    #         
+    #         # 1. execution_path 역추적을 통한 타겟 함수명 추출 (CRASH/EXIT 노드 우회)
+    #         import json
+    #         try:
+    #             exec_path = json.loads(row["execution_path"]) if row["execution_path"] else []
+    #         except Exception:
+    #             exec_path = []
+    #             
+    #         found_func = None
+    #         if exec_path:
+    #             for node in reversed(exec_path):
+    #                 node_clean = node.strip()
+    #                 if (node_clean.startswith("CRASH(") or 
+    #                     node_clean.startswith("EXIT(") or 
+    #                     node_clean in ("LLVMFuzzerTestOneInput", "FuzzedDataProvider")):
+    #                     continue
+    #                 
+    #                 # 함수 시그니처에서 베이스 함수명만 안전하게 파싱 (예: QL::Quote::value(...) -> value)
+    #                 func_name = node_clean.split("(")[0].split("::")[-1].strip()
+    #                 if func_name:
+    #                     found_func = func_name
+    #                     break
+    #         
+    #         if found_func:
+    #             target_func = found_func
+    #             print(f"[Mutation Trace] Found target function via execution_path traceback: {target_func}")
+    #         else:
+    #             # 2. 실패 시 기존 code_location 기반 파싱 Fallback
+    #             code_loc = row["code_location"]
+    #             if code_loc and "_depth" in code_loc:
+    #                 parts = code_loc.split("_depth")[-1].split("_", 1)
+    #                 if len(parts) > 1:
+    #                     func_with_args = parts[1]
+    #                     target_func = func_with_args.split("(")[0].split("::")[-1].strip()
+    #                     print(f"[Mutation Trace] Fallback to target function via code_location: {target_func}")
+    # except Exception as e:
+    #     print(f"[Mutation Error] Failed to extract target function: {e}")
+    #     pass
 
     if not row:
         try:
