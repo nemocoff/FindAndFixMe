@@ -332,8 +332,8 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
             seen_hashes.add(h)
             unique_critical.append((data, label))
 
-    # ── 3. 시간적 흐름에 따른 고른 분포를 가진 대표 Normal Path 샘플링 (150개로 대폭 확장) ──
-    max_normal_samples = 150
+    # ── 3. 시간적 흐름에 따른 고른 분포를 가진 대표 Normal Path 샘플링 (90개로 확장) ──
+    max_normal_samples = 90
     if len(unique_normal) > max_normal_samples:
         step = len(unique_normal) / max_normal_samples
         sampled_normal = [unique_normal[int(i * step)] for i in range(max_normal_samples)]
@@ -466,12 +466,18 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
                         fdp_seen = True
                     continue
                 fdp_seen = False
-                # 긴 템플릿 인자를 제거하여 함수명 간소화 (예: QuantLib::Handle<QuantLib::Quote>::Handle → Handle<Quote>::Handle)
+                # LLVMFuzzerTestOneInput 도 하네스 진입점이므로 간결하게
+                if func_name == "LLVMFuzzerTestOneInput":
+                    simplified.append("LLVMFuzzerTestOneInput")
+                    continue
+                # 긴 템플릿 인자를 정리하되, QuantLib/프로젝트 네임스페이스는 보존
                 short_name = func_name
-                # 네임스페이스는 마지막 클래스::함수만 유지
-                parts = short_name.split("::")
-                if len(parts) > 2:
-                    short_name = "::".join(parts[-2:])
+                # 중첩 템플릿 인자만 축약: QuantLib::Handle<QuantLib::Quote> → QuantLib::Handle<Quote>
+                import re
+                short_name = re.sub(r'QuantLib::(\w+)', r'\1', short_name)
+                # 첫 번째 QuantLib::는 보존하되 중첩된 것만 제거
+                if func_name.startswith("QuantLib::"):
+                    short_name = "QL::" + short_name
                 simplified.append(short_name)
             
             if simplified:
@@ -497,7 +503,14 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
         exec_path = resolved_paths.get(idx)
         if exec_path:
             execution_path_json = json.dumps(exec_path)
-            code_loc = exec_path[-1]  # 마지막 실행 지점을 함수명으로 마킹
+            # [핵심 개선] 실행 경로 전체의 고유 핑거프린트를 code_loc으로 사용
+            # 마지막 함수명만 사용하면 동일한 함수에서 끝나는 완전히 다른 경로가 하나로 뭉개짐
+            # → 경로 깊이 + 마지막 의미있는 함수로 고유한 경로 서명 생성
+            path_sig = "|".join(exec_path)
+            path_hash = hashlib.md5(path_sig.encode()).hexdigest()[:8]
+            # 사람이 읽을 수 있는 레이블: "depth=11 @ QL::Quote::Quote"
+            last_meaningful = exec_path[-1]
+            code_loc = f"path_{path_hash}_depth{len(exec_path)}_{last_meaningful}"
 
         trace_id = db.insert_trace(program_id, raw_bytes, source, execution_path_json)
         if trace_id is None:
