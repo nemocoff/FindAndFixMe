@@ -120,14 +120,7 @@ public:
                     mutations_log.push_back({1, "CWE-190 Integer Overflow", "injected"});
                 }
             }
-            if (const CXXOperatorCallExpr* CallOp = 
-                    Result.Nodes.getNodeAs<clang::CXXOperatorCallExpr>("cwe190_cxx")) {
-                Rewrite.ReplaceText(
-                    CallOp->getSourceRange(),
-                    "2147483647 + 1 /* Injected CWE-190: Integer Overflow (Overloaded) */"
-                );
-                mutations_log.push_back({1, "CWE-190 Integer Overflow", "injected"});
-            }
+
         }
 
         // ── [T10] CWE-193: 루프 경계 조건 반전 ───────────────────────────
@@ -195,11 +188,7 @@ public:
                                hasOperatorName("+"),
                                hasAncestor(functionDecl().bind("parent_func"))).bind("cwe190"),
                 &Callback);
-            Finder.addMatcher(
-                cxxOperatorCallExpr(isExpansionInMainFile(),
-                                    hasOverloadedOperatorName("+"),
-                                    hasAncestor(functionDecl().bind("parent_func"))).bind("cwe190_cxx"),
-                &Callback);
+
         }
 
         if (all || patternId == 2)
