@@ -116,10 +116,10 @@ public:
             if (const BinaryOperator* BinOp =
                     Result.Nodes.getNodeAs<clang::BinaryOperator>("cwe193")) {
                 if (BinOp->getOpcode() == BO_LT) {
-                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 1, "<=");
+                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 1, "<= /* Injected CWE-193: Off-By-One */");
                     mutations_log.push_back({2, "CWE-193 Boundary Condition Error", "injected"});
                 } else if (BinOp->getOpcode() == BO_LE) {
-                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 2, "<");
+                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 2, "< /* Injected CWE-193: Off-By-One */");
                     mutations_log.push_back({2, "CWE-193 Boundary Condition Error", "injected"});
                 }
             }
