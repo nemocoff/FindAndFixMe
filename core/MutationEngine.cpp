@@ -36,6 +36,14 @@ static llvm::cl::opt<int> PatternId(
     llvm::cl::cat(FindAndFixMeCategory)
 );
 
+// Target function for localized injection
+static llvm::cl::opt<std::string> TargetFunc(
+    "target-func",
+    llvm::cl::desc("Target function for injection (empty = everywhere)"),
+    llvm::cl::init(""),
+    llvm::cl::cat(FindAndFixMeCategory)
+);
+
 // [T8] ClangTool 실행 타임아웃 (초)
 static llvm::cl::opt<int> AstTimeout(
     "ast-timeout",
@@ -89,6 +97,17 @@ public:
     void setContext(ASTContext* C) { Context = C; }
 
     void run(const MatchFinder::MatchResult& Result) override {
+        // [New] Check TargetFunc filter
+        if (!TargetFunc.empty()) {
+            if (const FunctionDecl* FD = Result.Nodes.getNodeAs<FunctionDecl>("parent_func")) {
+                if (FD->getNameAsString() != TargetFunc) {
+                    return; // Skip if not inside the target function
+                }
+            } else {
+                return; // Skip if no parent_func bound
+            }
+        }
+
         // ── [T10] CWE-190: 정수 덧셈 오버플로우 주입 ──────────────────────
         if (targetPatternId == 0 || targetPatternId == 1) {
             if (const BinaryOperator* BinOp =
@@ -173,11 +192,13 @@ public:
         if (all || patternId == 1) {
             Finder.addMatcher(
                 binaryOperator(isExpansionInMainFile(),
-                               hasOperatorName("+")).bind("cwe190"),
+                               hasOperatorName("+"),
+                               hasAncestor(functionDecl().bind("parent_func"))).bind("cwe190"),
                 &Callback);
             Finder.addMatcher(
                 cxxOperatorCallExpr(isExpansionInMainFile(),
-                                    hasOverloadedOperatorName("+")).bind("cwe190_cxx"),
+                                    hasOverloadedOperatorName("+"),
+                                    hasAncestor(functionDecl().bind("parent_func"))).bind("cwe190_cxx"),
                 &Callback);
         }
 
@@ -185,18 +206,20 @@ public:
             Finder.addMatcher(
                 binaryOperator(isExpansionInMainFile(),
                                anyOf(hasOperatorName("<"), hasOperatorName("<=")),
-                               hasAncestor(forStmt())).bind("cwe193"),
+                               hasAncestor(forStmt(hasAncestor(functionDecl().bind("parent_func"))))).bind("cwe193"),
                 &Callback);
 
         if (all || patternId == 3)
             Finder.addMatcher(
                 declStmt(isExpansionInMainFile(),
-                         containsDeclaration(0, varDecl(hasType(pointerType())))).bind("cwe476"),
+                         containsDeclaration(0, varDecl(hasType(pointerType()))),
+                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe476"),
                 &Callback);
 
         if (all || patternId == 6)
             Finder.addMatcher(
-                cxxDeleteExpr(isExpansionInMainFile()).bind("cwe401"),
+                cxxDeleteExpr(isExpansionInMainFile(),
+                              hasAncestor(functionDecl().bind("parent_func"))).bind("cwe401"),
                 &Callback);
     }
 

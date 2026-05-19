@@ -763,16 +763,26 @@ def normalize_project_relative_path(path_str: str, base_dir: str) -> str:
 def _perform_injection(req: MutationInjectRequest):
     actual_node_id: Optional[int] = None
     row = None
+    target_func = ""
     try:
         with get_db_connection() as conn:
             row = conn.execute(
-                """SELECT t.id as program_id, t.file_path, t.original_code, t.source_file_path
+                """SELECT t.id as program_id, t.file_path, t.original_code, t.source_file_path, c.code_location
                    FROM TargetProgram t
                    JOIN DynamicTrace d ON d.program_id = t.id
                    JOIN CornerCaseNode c ON c.trace_id = d.id
                    WHERE c.id = ?""", (req.node_id,)
             ).fetchone()
-        if row: actual_node_id = req.node_id
+        if row: 
+            actual_node_id = req.node_id
+            code_loc = row["code_location"]
+            if code_loc and "_depth" in code_loc:
+                # Format: path_HASH_depthN_FunctionName(...)
+                # Example: path_89ab_depth5_compute_sum(int, int) -> compute_sum
+                parts = code_loc.split("_depth")[-1].split("_", 1)
+                if len(parts) > 1:
+                    func_with_args = parts[1]
+                    target_func = func_with_args.split("(")[0].strip()
     except Exception: pass
 
     if not row:
@@ -841,7 +851,10 @@ def _perform_injection(req: MutationInjectRequest):
 
     for pid in patterns:
         try:
-            cmd = [container_engine_bin, container_source_path, f"--pattern-id={pid}", "--"] + container_compile_args
+            cmd = [container_engine_bin, container_source_path, f"--pattern-id={pid}"]
+            if target_func:
+                cmd.append(f"--target-func={target_func}")
+            cmd.extend(["--"] + container_compile_args)
             print(f"[Mutation Trace] Executing MutationEngine inside Sandbox: {' '.join(cmd)}")
             res = _run_cmd_in_docker(cmd, mounts=mounts, network="bridge", timeout=30)
             
