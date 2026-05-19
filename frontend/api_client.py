@@ -69,7 +69,7 @@ def inject_mutation(node_id, pattern_id, wait=False):
     payload = {"node_id": node_id, "pattern_id": pattern_id}
     res_json = _make_request("POST", f"{API_BASE_URL}/mutations/inject", json=payload)
     if wait and res_json.get("task_id"):
-        return wait_for_task(res_json["task_id"], timeout=60)
+        return wait_for_task(res_json["task_id"], timeout=150)
     return res_json
 
 def validate_mutant(mutant_id, wait=False):
