@@ -3,11 +3,58 @@ import pandas as pd
 from streamlit_echarts import st_echarts
 
 
+def _has_corner_case(node: dict) -> bool:
+    """노드 또는 하위 노드 중 코너케이스가 있는지 여부 판별"""
+    if node.get("is_corner_case", False):
+        return True
+    if node.get("name") in ("Crash Paths", "Timeout Paths"):
+        return True
+    for child in node.get("children", []):
+        if _has_corner_case(child):
+            return True
+    return False
+
+
+def _simplify_function_name(name: str, max_len: int = 24) -> str:
+    """긴 C++ 함수명을 가독성 좋고 겹치지 않게 축소. 단, 툴팁에는 전체명이 보존됨."""
+    if len(name) <= max_len:
+        return name
+        
+    # 1. 괄호와 괄호 안의 매개변수 목록 제거
+    # 예: my_func(int, float) -> my_func
+    if "(" in name:
+        name = name.split("(")[0].strip()
+        
+    # 2. C++ 템플릿 인자 <...> 제거
+    clean_name = ""
+    depth = 0
+    for char in name:
+        if char == "<":
+            depth += 1
+        elif char == ">":
+            depth -= 1
+        elif depth == 0:
+            clean_name += char
+            
+    # 3. 네임스페이스가 너무 길면 마지막 2개 세그먼트만 추출
+    if "::" in clean_name:
+        parts = clean_name.split("::")
+        if len(parts) > 2:
+            clean_name = "::".join(parts[-2:])
+            
+    # 4. 그래도 너무 길면 글자수 잘라내고 ... 붙임
+    if len(clean_name) > max_len:
+        return clean_name[:max_len - 3] + "..."
+    return clean_name
+
+
 def _process_node(node: dict, max_hits: int) -> dict:
     """
-    재귀적으로 노드를 처리하며 ECharts 스타일 적용.
+    재귀적으로 노드를 처리하며 ECharts 스타일 및 자동 펼침/접힘 속성 적용.
     - 코너케이스: 빨간색
     - 일반노드: hit_count에 따른 파란색 농도 조절
+    - 코너케이스 포함 경로: collapsed = False (기본 펼침)
+    - 일반 경로: collapsed = True (기본 접힘)
     """
     is_cc = node.get("is_corner_case", False)
     hits = node.get("hit_count", 0)
@@ -27,11 +74,18 @@ def _process_node(node: dict, max_hits: int) -> dict:
     if snippet:
         # HTML 엔티티 처리 및 줄바꿈 적용
         safe_snippet = snippet.replace("\n", "<br/>").replace(" ", "&nbsp;")
-        tooltip_text += f"<br/><hr/><b>Code Trace:</b><br/><code style='font-family:monospace; font-size:11px;'>{safe_snippet}</code>"
+        tooltip_text += f"<br/><hr/><b>Code Trace:</b><br/><code style='font-family:monospace; font-size:11px; word-break:break-all; white-space:pre-wrap;'>{safe_snippet}</code>"
+
+    # 코너케이스 관련 경로(본인 또는 후손이 코너케이스이거나 최상위 Main 노드)는 펼침
+    has_cc = _has_corner_case(node) or name == "Main"
+
+    # ECharts 그래프 노드 상의 라벨용으로 이름 축소 (겹침 원천 방지)
+    display_name = _simplify_function_name(name)
 
     processed = {
-        "name": name,
+        "name": display_name,
         "value": hits,
+        "collapsed": not has_cc, # 코너케이스가 있으면 펼치고(collapsed=False), 없으면 접음(collapsed=True)
         "itemStyle": {"color": color, "borderColor": color},
         "label": {"show": True, "color": "#333"},
         "tooltip": {"formatter": tooltip_text},
@@ -47,7 +101,7 @@ def render_trace_tree_and_table(tree_data=None, cc_data=None, total_traces=0, ex
     - 코너 케이스: 빨간색 강조 및 코드 툴팁
     """
     execs_formatted = f"{int(execs_done):,}" if execs_done else "0"
-    st.markdown(f"### 🌲 Dynamic Execution Path Tree (탐색된 {total_traces}개 경로)")
+    st.markdown(f"### Dynamic Execution Path Tree ({total_traces} Paths)")
 
     # ── 1. 범례 ────────────────────────────────────────────────────────────────
     legend_html = """
@@ -76,7 +130,7 @@ def render_trace_tree_and_table(tree_data=None, cc_data=None, total_traces=0, ex
             "triggerOn": "mousemove",
             "enterable": True, # 툴팁 안의 텍스트 드래그 가능하게
             "backgroundColor": "rgba(255, 255, 255, 0.95)",
-            "extraCssText": "box-shadow: 0 0 8px rgba(0,0,0,0.3); border-radius: 4px; padding: 10px; max-width: 400px; white-space: normal;"
+            "extraCssText": "box-shadow: 0 0 8px rgba(0,0,0,0.3); border-radius: 4px; padding: 10px; max-width: 550px; white-space: normal; word-break: break-all; overflow-wrap: break-word;"
         },
         "series": [
             {
@@ -90,20 +144,24 @@ def render_trace_tree_and_table(tree_data=None, cc_data=None, total_traces=0, ex
                 "symbolSize": 18,
                 "orient": "LR", # Left to Right
                 "label": {
-                    "position": "top",
-                    "rotate": 0,
+                    "show": False,
+                    "position": "left",
+                    "align": "right",
                     "verticalAlign": "middle",
-                    "align": "middle",
                     "fontSize": 11
                 },
                 "leaves": {
                     "label": {
+                        "show": True,
                         "position": "right",
                         "align": "left"
                     }
                 },
+                "labelLayout": {
+                    "hideOverlap": True
+                },
                 "expandAndCollapse": True,
-                "initialTreeDepth": 2,
+                "initialTreeDepth": -1,
                 "lineStyle": {"width": 2, "curveness": 0.5}
             }
         ]
@@ -113,7 +171,7 @@ def render_trace_tree_and_table(tree_data=None, cc_data=None, total_traces=0, ex
 
     # ── 3. 상세 테이블 (기존 기능 유지) ─────────────────────────────────────────
     if cc_data:
-        st.markdown("#### 🚩 탐지된 코너 케이스 상세 리스트")
+        st.markdown("#### Detected Corner Cases")
         df_rows = []
         for cc in cc_data:
             df_rows.append({

@@ -8,6 +8,8 @@ core/test_target.cpp
 inspect_mutations.py
 afl_output/
 temp_targets/
+scratch/
+tests.zip
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -35,3 +37,8 @@ venv.bak/
 
 # Build artifacts
 core/build/
+
+# SQLite temp files
+*.sqlite-shm
+*.sqlite-wal
+
