@@ -37,3 +37,8 @@ venv.bak/
 
 # Build artifacts
 core/build/
+
+# SQLite temp files
+*.sqlite-shm
+*.sqlite-wal
+

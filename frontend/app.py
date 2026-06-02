@@ -15,7 +15,7 @@ def _run_pipeline_ui(prog_id: int, status_container, pattern_options, selected_p
     st.write("Compiling target and extracting AST (with auto-flags)...")
     compile_target(prog_id, wait=True)
     
-    st.write("Running AFL++ Fuzzer to collect traces (60s)...")
+    st.write("Running AFL++ Fuzzer to collect traces...")
     res_traces = collect_traces(prog_id, fuzz_seconds=60, wait=True)
     
     st.write("Identifying Corner Cases from execution traces...")
@@ -57,7 +57,7 @@ def main() -> None:
     FindAndFixMe C++ Migration Dashboard
     """
     st.set_page_config(page_title="FindAndFixMe Dashboard", layout="wide")
-    st.title("FindAndFixMe Dashboard (C++ Core Engine)")
+    st.title("FindAndFixMe Dashboard")
     
     import_type = st.radio("Choose Input Method", ["File Upload", "Import from Github"])
     
@@ -111,7 +111,7 @@ def main() -> None:
                 st.session_state["validation_results"] = {}
                 try:
                     with st.status("Running FindAndFixMe Github Pipeline...", expanded=True) as status:
-                        st.write("Cloning repo and compiling dependencies in background... (This may take a few minutes)")
+                        st.write("Cloning repo and compiling dependencies in background...")
                         res_upload = upload_github_target(repo_url, target_file)
                         prog_id = res_upload["program_id"]
                         

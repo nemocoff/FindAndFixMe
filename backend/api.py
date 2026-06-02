@@ -850,7 +850,7 @@ def _perform_injection(req: MutationInjectRequest):
                 cmd.append(f"--target-func={target_func}")
             cmd.extend(["--"] + container_compile_args)
             print(f"[Mutation Trace] Executing MutationEngine inside Sandbox: {' '.join(cmd)}")
-            res = _run_cmd_in_docker(cmd, mounts=mounts, network="bridge", timeout=60)
+            res = _run_cmd_in_docker(cmd, mounts=mounts, network="bridge", timeout=90)
             
             stdout_str = res.stdout.decode('utf-8', errors='ignore') if isinstance(res.stdout, bytes) else str(res.stdout)
             stderr_str = res.stderr.decode('utf-8', errors='ignore') if isinstance(res.stderr, bytes) else str(res.stderr)
