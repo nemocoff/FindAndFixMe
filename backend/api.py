@@ -992,11 +992,26 @@ def _perform_injection(req: MutationInjectRequest):
     if host_source_file_path and os.path.exists(os.path.dirname(host_source_file_path)):
         with open(host_source_file_path, "w", encoding="utf-8") as f: f.write(mutated_code)
 
+    # ── US-06: Compilation Verification & Rollback Safety ──────────────
+    mutant_bin = mutant_src.replace(".cpp", "")
     try:
-        mutant_bin = mutant_src.replace(".cpp", "")
-        # 컴파일러도 호스트에 알맞게 정규화된 소스 코드 경로를 통해 빌드 수행
-        if not _compile_regular(mutant_src, mutant_bin): mutant_binary_path = mutant_bin
-    except: pass
+        compile_err = _compile_regular(mutant_src, mutant_bin)
+    except Exception as compile_exc:
+        compile_err = f"Compilation exception: {type(compile_exc).__name__}: {compile_exc}"
+
+    if compile_err:
+        # Rollback: restore original source file
+        if host_source_file_path and os.path.exists(os.path.dirname(host_source_file_path)):
+            with open(host_source_file_path, "w", encoding="utf-8") as f:
+                f.write(original_code)
+        # Cleanup: remove the broken mutant source file
+        if os.path.exists(mutant_src):
+            os.remove(mutant_src)
+        raise Exception(
+            f"[US-06 Rollback] Mutant compilation failed. Original source restored.\n"
+            f"Compiler output:\n{compile_err}"
+        )
+    mutant_binary_path = mutant_bin
 
     mutant_id = db.insert_mutant(program_id, actual_node_id, req.pattern_id, original_code, mutated_code, mutant_binary_path)
     return {

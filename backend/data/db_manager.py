@@ -75,6 +75,7 @@ class TraceDBManager:
                     original_code TEXT NOT NULL,
                     binary_path TEXT,
                     afl_binary_path TEXT,
+                    source_file_path TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
