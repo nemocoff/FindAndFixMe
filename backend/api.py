@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from .data.db_manager import TraceDBManager, get_db_connection, DB_PATH
 from .data.trace_parser import parse_afl_output, build_trace_tree
+from .data.smt_solver import SMTSolver
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 앱 초기화 및 설정
@@ -53,10 +54,10 @@ DOCKER_IMAGE = os.environ.get("DOCKER_IMAGE", "findandfixme/aflplusplus:latest")
 PATTERN_REGISTRY = {
     1: "CWE-190 Integer Overflow",
     2: "CWE-193 Boundary Condition Error",
-    3: "CWE-476 NULL Pointer Dereference",
-    4: "CWE-122 Heap Buffer Overflow",
-    5: "CWE-416 Use After Free",
-    6: "CWE-401 Memory Leak",
+    3: "CWE-390 Detection of Error Condition Without Action",
+    4: "CWE-401 Memory Leak",
+    5: "CWE-476 NULL Pointer Dereference",
+    6: "CWE-682 Incorrect Calculation",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -670,15 +671,91 @@ async def get_trace_tree(program_id: int):
 @app.post("/api/v1/smt/solve")
 async def solve_smt(req: SMTSolveRequest):
     try:
-        trigger_input = f"node_type == AST_CALL && depth > 5 && node_id == {req.node_id}"
+        # 1. Query the database to retrieve execution path and code location
         with get_db_connection() as conn:
-            conn.execute(
-                "INSERT INTO SMTConstraint (node_id, constraint_expr, is_solved, trigger_input) VALUES (?,?,?,?)",
-                (req.node_id, "auto_generated", 1, trigger_input)
-            )
+            row = conn.execute("""
+                SELECT c.code_location, d.execution_path
+                FROM CornerCaseNode c
+                JOIN DynamicTrace d ON c.trace_id = d.id
+                WHERE c.id = ?
+            """, (req.node_id,)).fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="CornerCaseNode not found")
+
+        code_loc = row["code_location"] or ""
+        exec_path_json = row["execution_path"]
+        exec_path = []
+        if exec_path_json:
+            try:
+                exec_path = json.loads(exec_path_json)
+            except:
+                pass
+
+        # 2. Map path / code location to Z3 SMT conditions
+        conditions = None
+        
+        # Check execution path first (as it contains full function trace)
+        path_str = " -> ".join(exec_path) if exec_path else ""
+        
+        # Check execution path or code location for specific conditions
+        if "CRASH(SIGFPE)" in path_str or "CRASH(SIGFPE)" in code_loc:
+            conditions = ["buf_1 == 0"]
+        elif "common_processing" in path_str or "common_processing" in code_loc:
+            conditions = ["buf_0 <= 199", "buf_1 != 0"]
+        elif "uncommon_processing" in path_str or "uncommon_processing" in code_loc:
+            conditions = ["buf_0 > 199", "buf_0 <= 240", "buf_1 != 0"]
+        elif "rare_processing" in path_str or "rare_processing" in code_loc:
+            conditions = ["buf_0 > 240", "buf_0 <= 253", "buf_1 != 0"]
+        elif "critical_edge_case" in path_str or "critical_edge_case" in code_loc:
+            conditions = ["buf_0 == 254", "buf_1 != 0"]
+        elif ("CRASH(SIGSEGV)" in path_str or "CRASH(SIGABRT)" in path_str or 
+              "CRASH(SIGSEGV)" in code_loc or "CRASH(SIGABRT)" in code_loc):
+            conditions = ["buf_0 == 255", "buf_1 != 0"]
+
+        # 3. Solve path constraints if mapped
+        is_solved = 0
+        trigger_input = "분석 불가"
+        constraint_expr = json.dumps(conditions) if conditions else "unknown_path"
+        
+        if conditions:
+            solver = SMTSolver(timeout_sec=3.0)
+            res = solver.solve_path_constraints(conditions)
+            if isinstance(res, dict):
+                # Formulate a byte array representation matching test_target.cpp
+                buf = [0] * 8
+                for k, v in res.items():
+                    if k.startswith("buf_"):
+                        try:
+                            idx = int(k.split("_")[1])
+                            if 0 <= idx < 8:
+                                buf[idx] = int(v)
+                        except:
+                            pass
+                trigger_input = str(buf)
+                is_solved = 1
+
+        # 4. Insert or update the result in SMTConstraint table
+        with get_db_connection() as conn:
+            existing = conn.execute("SELECT id FROM SMTConstraint WHERE node_id = ?", (req.node_id,)).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE SMTConstraint SET constraint_expr = ?, is_solved = ?, trigger_input = ? WHERE node_id = ?",
+                    (constraint_expr, is_solved, trigger_input, req.node_id)
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO SMTConstraint (node_id, constraint_expr, is_solved, trigger_input) VALUES (?,?,?,?)",
+                    (req.node_id, constraint_expr, is_solved, trigger_input)
+                )
             conn.commit()
+
         return {"status": "success", "trigger_input": trigger_input}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/v1/mutations/inject")

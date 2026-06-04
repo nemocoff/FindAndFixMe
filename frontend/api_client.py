@@ -72,6 +72,10 @@ def inject_mutation(node_id, pattern_id, wait=False):
         return wait_for_task(res_json["task_id"], timeout=180)
     return res_json
 
+def solve_smt(node_id):
+    payload = {"node_id": node_id}
+    return _make_request("POST", f"{API_BASE_URL}/smt/solve", json=payload)
+
 def validate_mutant(mutant_id, wait=False):
     res_json = _make_request("POST", f"{API_BASE_URL}/mutations/{mutant_id}/validate")
     if wait and res_json.get("task_id"):
@@ -127,6 +131,13 @@ def _run_pipeline_tail(prog_id):
     print(f"[{prog_id}] Injecting mutation at node {target_node}...")
     res_mut = inject_mutation(target_node, 1, wait=True)
     
+    # Run SMT solver to get trigger input
+    try:
+        res_smt = solve_smt(target_node)
+        trigger_input = res_smt.get("trigger_input", "")
+    except Exception:
+        trigger_input = ""
+        
     return {
         "status": "success",
         "program_id": prog_id,
@@ -136,7 +147,8 @@ def _run_pipeline_tail(prog_id):
                     "pattern_name": res_mut.get("pattern_name"),
                     "original_code": res_mut.get("original_code"), 
                     "mutated_code": res_mut.get("mutated_code"),
-                    "mutant_id": res_mut.get("mutant_id")
+                    "mutant_id": res_mut.get("mutant_id"),
+                    "trigger_input": trigger_input
                 }
             ],
             "corner_cases": cc_list

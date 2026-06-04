@@ -31,7 +31,7 @@ static llvm::cl::OptionCategory FindAndFixMeCategory("FindAndFixMe Options");
 // [T10] 주입할 패턴 ID (CLI --pattern-id 옵션으로 지정)
 static llvm::cl::opt<int> PatternId(
     "pattern-id",
-    llvm::cl::desc("결함 주입 패턴 ID (1=CWE-190, 2=CWE-193, 3~6=확장 예정)"),
+    llvm::cl::desc("결함 주입 패턴 ID (1=CWE-190, 2=CWE-193, 3=CWE-390, 4=CWE-401, 5=CWE-476, 6=CWE-682)"),
     llvm::cl::init(0),  // 0 = 모든 패턴 적용
     llvm::cl::cat(FindAndFixMeCategory)
 );
@@ -58,10 +58,10 @@ static llvm::cl::opt<int> AstTimeout(
 static const std::map<int, std::string> PATTERN_REGISTRY = {
     {1, "CWE-190 Integer Overflow"},
     {2, "CWE-193 Boundary Condition Error"},
-    {3, "CWE-476 NULL Pointer Dereference"},
-    {4, "CWE-122 Heap Buffer Overflow"},
-    {5, "CWE-416 Use After Free"},
-    {6, "CWE-401 Memory Leak"},
+    {3, "CWE-390 Detection of Error Condition Without Action"},
+    {4, "CWE-401 Memory Leak"},
+    {5, "CWE-476 NULL Pointer Dereference"},
+    {6, "CWE-682 Incorrect Calculation"},
 };
 
 // JSON 이스케이프 헬퍼
@@ -86,9 +86,6 @@ struct MutationResult {
     std::string status;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AST 매처 콜백
-// ─────────────────────────────────────────────────────────────────────────────
 class FaultInjectionCallback : public MatchFinder::MatchCallback {
 public:
     FaultInjectionCallback(Rewriter& R, std::vector<MutationResult>& log, int targetPatternId)
@@ -120,7 +117,6 @@ public:
                     mutations_log.push_back({1, "CWE-190 Integer Overflow", "injected"});
                 }
             }
-
         }
 
         // ── [T10] CWE-193: 루프 경계 조건 반전 ───────────────────────────
@@ -137,29 +133,68 @@ public:
             }
         }
 
-        // ── [T10] CWE-476: NULL 포인터 역참조 주입 ────────────────────────
-        if (targetPatternId == 3) {
-            if (const DeclStmt* DS =
-                    Result.Nodes.getNodeAs<DeclStmt>("cwe476")) {
-                // 포인터 변수 선언 직후 강제 NULL 역참조 삽입
+        // ── CWE-390: 예외 처리 누락 ───────────────────────────
+        if (targetPatternId == 0 || targetPatternId == 3) {
+            if (const CXXCatchStmt* Catch = Result.Nodes.getNodeAs<CXXCatchStmt>("cwe390_catch")) {
+                if (const Stmt* Block = Catch->getHandlerBlock()) {
+                    Rewrite.ReplaceText(Block->getSourceRange(), "{ /* Exception ignored - Injected CWE-390 */ }");
+                    mutations_log.push_back({3, "CWE-390 Detection of Error Condition Without Action", "injected"});
+                }
+            }
+            else if (const IfStmt* If = Result.Nodes.getNodeAs<IfStmt>("cwe390_if")) {
+                if (const Stmt* Then = If->getThen()) {
+                    Rewrite.ReplaceText(Then->getSourceRange(), "{ /* Error handling ignored - Injected CWE-390 */ }");
+                    mutations_log.push_back({3, "CWE-390 Detection of Error Condition Without Action", "injected"});
+                }
+            }
+        }
+
+        // ── CWE-401: 메모리 누수 ───────────────────────────
+        if (targetPatternId == 0 || targetPatternId == 4) {
+            if (const CXXDeleteExpr* DelExpr = Result.Nodes.getNodeAs<CXXDeleteExpr>("cwe401_delete")) {
+                Rewrite.ReplaceText(DelExpr->getSourceRange(), "/* delete removed - Injected CWE-401 */");
+                mutations_log.push_back({4, "CWE-401 Memory Leak", "injected"});
+            }
+            else if (const CallExpr* FreeCall = Result.Nodes.getNodeAs<CallExpr>("cwe401_free")) {
+                Rewrite.ReplaceText(FreeCall->getSourceRange(), "/* free removed - Injected CWE-401 */");
+                mutations_log.push_back({4, "CWE-401 Memory Leak", "injected"});
+            }
+        }
+
+        // ── CWE-476: NULL 포인터 역참조 ───────────────────────────
+        if (targetPatternId == 0 || targetPatternId == 5) {
+            if (const VarDecl* VD = Result.Nodes.getNodeAs<VarDecl>("cwe476_decl")) {
+                if (const Expr* Init = Result.Nodes.getNodeAs<Expr>("cwe476_init")) {
+                    Rewrite.ReplaceText(Init->getSourceRange(), "nullptr");
+                    mutations_log.push_back({5, "CWE-476 NULL Pointer Dereference", "injected"});
+                }
+            } else if (const DeclStmt* DS = Result.Nodes.getNodeAs<DeclStmt>("cwe476_stmt")) {
                 SourceLocation insertLoc = DS->getEndLoc().getLocWithOffset(1);
                 Rewrite.InsertTextAfter(
                     insertLoc,
                     "\n*((int*)nullptr) = 0; /* Injected CWE-476: NULL Pointer Dereference */"
                 );
-                mutations_log.push_back({3, "CWE-476 NULL Pointer Dereference", "injected"});
+                mutations_log.push_back({5, "CWE-476 NULL Pointer Dereference", "injected"});
             }
         }
 
-        // ── [T10] CWE-401: 메모리 누수 — delete 제거 ─────────────────────
-        if (targetPatternId == 6) {
-            if (const CXXDeleteExpr* DelExpr =
-                    Result.Nodes.getNodeAs<CXXDeleteExpr>("cwe401")) {
-                Rewrite.ReplaceText(
-                    DelExpr->getSourceRange(),
-                    "/* delete removed — Injected CWE-401: Memory Leak */"
-                );
-                mutations_log.push_back({6, "CWE-401 Memory Leak", "injected"});
+        // ── CWE-682: 논리 연산자 및 비트 연산자 혼동 및 연산 오류 ──────────────
+        if (targetPatternId == 0 || targetPatternId == 6) {
+            if (const BinaryOperator* BinOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe682")) {
+                std::string rep = "";
+                unsigned opLen = BinOp->getOpcodeStr().size();
+                if (BinOp->getOpcode() == BO_LAnd) { rep = "&"; }
+                else if (BinOp->getOpcode() == BO_LOr) { rep = "|"; }
+                else if (BinOp->getOpcode() == BO_And) { rep = "&&"; }
+                else if (BinOp->getOpcode() == BO_Or) { rep = "||"; }
+                else if (BinOp->getOpcode() == BO_Rem) { rep = "/"; }
+                else if (BinOp->getOpcode() == BO_Div) { rep = "%"; }
+                else if (BinOp->getOpcode() == BO_Mul) { rep = "+"; }
+                
+                if (!rep.empty()) {
+                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), opLen, rep + " /* Injected CWE-682 */");
+                    mutations_log.push_back({6, "CWE-682 Incorrect Calculation", "injected"});
+                }
             }
         }
     }
@@ -179,7 +214,6 @@ public:
     MyASTConsumer(Rewriter& R, std::vector<MutationResult>& log, int patternId)
         : Callback(R, log, patternId) {
 
-        // [T10] patternId 0 = 전체, 그 외 해당 패턴만 등록
         bool all = (patternId == 0);
 
         if (all || patternId == 1) {
@@ -188,28 +222,71 @@ public:
                                hasOperatorName("+"),
                                hasAncestor(functionDecl().bind("parent_func"))).bind("cwe190"),
                 &Callback);
-
         }
 
-        if (all || patternId == 2)
+        if (all || patternId == 2) {
             Finder.addMatcher(
                 binaryOperator(isExpansionInMainFile(),
                                anyOf(hasOperatorName("<"), hasOperatorName("<=")),
                                hasAncestor(forStmt(hasAncestor(functionDecl().bind("parent_func"))))).bind("cwe193"),
                 &Callback);
+        }
 
-        if (all || patternId == 3)
+        if (all || patternId == 3) {
+            Finder.addMatcher(
+                cxxCatchStmt(isExpansionInMainFile(),
+                             hasAncestor(functionDecl().bind("parent_func"))).bind("cwe390_catch"),
+                &Callback);
+            Finder.addMatcher(
+                ifStmt(isExpansionInMainFile(),
+                       hasThen(stmt(anyOf(
+                           returnStmt(),
+                           callExpr(callee(functionDecl(hasAnyName("abort", "exit")))),
+                           compoundStmt(hasAnySubstatement(anyOf(
+                               returnStmt(),
+                               callExpr(callee(functionDecl(hasAnyName("abort", "exit"))))
+                           )))
+                       ))),
+                       hasAncestor(functionDecl().bind("parent_func"))).bind("cwe390_if"),
+                &Callback);
+        }
+
+        if (all || patternId == 4) {
+            Finder.addMatcher(
+                cxxDeleteExpr(isExpansionInMainFile(),
+                              hasAncestor(functionDecl().bind("parent_func"))).bind("cwe401_delete"),
+                &Callback);
+            Finder.addMatcher(
+                callExpr(isExpansionInMainFile(),
+                         callee(functionDecl(hasName("free"))),
+                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe401_free"),
+                &Callback);
+        }
+
+        if (all || patternId == 5) {
+            Finder.addMatcher(
+                varDecl(isExpansionInMainFile(),
+                        hasType(pointerType()),
+                        hasInitializer(expr().bind("cwe476_init")),
+                        hasAncestor(functionDecl().bind("parent_func"))).bind("cwe476_decl"),
+                &Callback);
             Finder.addMatcher(
                 declStmt(isExpansionInMainFile(),
                          containsDeclaration(0, varDecl(hasType(pointerType()))),
-                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe476"),
+                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe476_stmt"),
                 &Callback);
+        }
 
-        if (all || patternId == 6)
+        if (all || patternId == 6) {
             Finder.addMatcher(
-                cxxDeleteExpr(isExpansionInMainFile(),
-                              hasAncestor(functionDecl().bind("parent_func"))).bind("cwe401"),
+                binaryOperator(isExpansionInMainFile(),
+                               anyOf(hasOperatorName("&&"), hasOperatorName("||"),
+                                     hasOperatorName("&"), hasOperatorName("|"),
+                                     hasOperatorName("%"), hasOperatorName("/"),
+                                     hasOperatorName("*")),
+                               hasAncestor(functionDecl().bind("parent_func"))).bind("cwe682"),
                 &Callback);
+        }
     }
 
     void HandleTranslationUnit(ASTContext& Context) override {

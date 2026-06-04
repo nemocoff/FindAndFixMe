@@ -3,7 +3,8 @@ import pandas as pd
 import requests
 from api_client import (
     upload_targets, compile_target, collect_traces, get_corner_cases, inject_mutation, 
-    upload_github_target, validate_mutant, get_trace_tree, wait_for_github_import
+    upload_github_target, validate_mutant, get_trace_tree, wait_for_github_import,
+    solve_smt
 )
 from components.trace_tree import render_trace_tree_and_table
 from components.diff_viewer import render_diff_viewer
@@ -34,6 +35,14 @@ def _run_pipeline_ui(prog_id: int, status_container, pattern_options, selected_p
         target_node = cc_list[0]["id"]
         res_mut = inject_mutation(target_node, selected_pattern_id, wait=True)
         
+        st.write("Solving path constraints with Z3 SMT Solver...")
+        try:
+            res_smt = solve_smt(target_node)
+            trigger_input = res_smt.get("trigger_input", "")
+        except Exception as e:
+            st.warning(f"SMT Solver failed: {e}")
+            trigger_input = ""
+        
         st.session_state["analysis_result"] = {
             "status": "success",
             "program_id": prog_id,
@@ -42,7 +51,8 @@ def _run_pipeline_ui(prog_id: int, status_container, pattern_options, selected_p
                     "pattern_name": res_mut.get("pattern_name"),
                     "original_code": res_mut.get("original_code"), 
                     "mutated_code": res_mut.get("mutated_code"),
-                    "mutant_id": res_mut.get("mutant_id")
+                    "mutant_id": res_mut.get("mutant_id"),
+                    "trigger_input": trigger_input
                 }],
                 "corner_cases": cc_list,
                 "tree_data": tree_data,
@@ -149,7 +159,7 @@ def main() -> None:
         else:
             for idx, mut in enumerate(mutations):
                 st.markdown(f"#### Mutation {idx+1}: {mut.get('pattern_name', 'Unknown Pattern')}")
-                render_diff_viewer(mut.get('original_code', ''), mut.get('mutated_code', ''))
+                render_diff_viewer(mut.get('original_code', ''), mut.get('mutated_code', ''), mut.get('trigger_input', ''))
                 
                 m_id = mut.get('mutant_id')
                 
