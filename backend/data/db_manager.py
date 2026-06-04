@@ -79,23 +79,20 @@ class TraceDBManager:
                 )
             ''')
 
-            # 2. DynamicTrace — input_hash UNIQUE 로 중복 방지 (T6)
+            # 2. DynamicTrace — (program_id, input_hash) UNIQUE 로 중복 방지 (T6)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS DynamicTrace (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     program_id INTEGER NOT NULL,
-                    input_hash TEXT UNIQUE NOT NULL,
+                    input_hash TEXT NOT NULL,
                     raw_input BLOB,
                     source TEXT CHECK(source IN ('afl_queue','afl_crash','afl_hang')),
                     execution_path TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(program_id) REFERENCES TargetProgram(id) ON DELETE CASCADE
+                    FOREIGN KEY(program_id) REFERENCES TargetProgram(id) ON DELETE CASCADE,
+                    UNIQUE(program_id, input_hash)
                 )
             ''')
-            try:
-                cursor.execute("ALTER TABLE DynamicTrace ADD COLUMN execution_path TEXT")
-            except Exception:
-                pass
 
             # 3. CornerCaseNode — 유동적인 코너 케이스 탐지 지원을 위해 CHECK 제약 제거
             cursor.execute('''
@@ -159,11 +156,11 @@ class TraceDBManager:
     # [T6, T7] 트레이스 적재 — MD5 해시 중복 제거
     # ─────────────────────────────────────────────
     def insert_trace(self, program_id: int, raw_input: bytes, source: str, execution_path: Optional[str] = None) -> Optional[int]:
-        """중복 입력을 MD5 해시로 필터링 후 DynamicTrace에 INSERT."""
+        """중복 입력을 MD5 해시로 필터링 후 DynamicTrace에 INSERT. 이미 존재하면 기존 ID 리턴."""
         input_hash = hashlib.md5(raw_input).hexdigest()
         with get_db_connection(self.db_path) as conn:
+            cursor = conn.cursor()
             try:
-                cursor = conn.cursor()
                 cursor.execute(
                     "INSERT INTO DynamicTrace (program_id, input_hash, raw_input, source, execution_path) VALUES (?,?,?,?,?)",
                     (program_id, input_hash, raw_input, source, execution_path)
@@ -171,7 +168,14 @@ class TraceDBManager:
                 conn.commit()
                 return cursor.lastrowid
             except sqlite3.IntegrityError:
-                # UNIQUE 제약 위반 = 중복 → 무시
+                # UNIQUE 제약 위반 시, 이미 존재하는 동일 program_id & input_hash의 ID 조회 후 반환
+                cursor.execute(
+                    "SELECT id FROM DynamicTrace WHERE program_id = ? AND input_hash = ?",
+                    (program_id, input_hash)
+                )
+                row = cursor.fetchone()
+                if row:
+                    return row[0]
                 return None
 
     # ─────────────────────────────────────────────

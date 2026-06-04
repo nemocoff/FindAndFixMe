@@ -26,21 +26,84 @@ CRASH_EXEC_FREQ = 0.001
 CORNER_CASE_THRESHOLD = 0.01   # [T9] 1% 미만 = 코너 케이스
 
 
+def _get_host_project_root() -> str:
+    """
+    호스트 상의 프로젝트 루트 경로를 구합니다.
+    Docker 컨테이너 안에서 실행 중이면 docker inspect를 통해 /app에 마운트된 호스트 경로를 찾아내고,
+    그렇지 않으면 로컬 파일 시스템 경로를 기반으로 추정합니다.
+    리턴되는 경로는 항상 forward slash(/)를 사용하며, 드라이브 문자는 /c/ 형태로 변환됩니다.
+    예: C:\\FindAndFixMe -> /c/FindAndFixMe
+    """
+    import socket
+    
+    host_path = None
+    
+    # 1. Docker 컨테이너 내부인 경우, docker inspect로 호스트 마운트 소스 경로 조회 시도
+    try:
+        container_id = socket.gethostname()
+        res = subprocess.run(["docker", "inspect", container_id], capture_output=True, text=True, timeout=3)
+        if res.returncode == 0:
+            info = json.loads(res.stdout)
+            if info and len(info) > 0:
+                mounts = info[0].get("Mounts", [])
+                for m in mounts:
+                    if m.get("Destination") == "/app":
+                        host_path = m.get("Source")
+                        break
+    except Exception:
+        pass
+        
+    # 2. 컨테이너 내부가 아니거나 inspect 실패 시, __file__ 기준 로컬 파일 시스템 경로 사용
+    if not host_path:
+        try:
+            # backend/data/trace_parser.py 이므로 2단계 상위 폴더가 루트
+            host_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        except Exception:
+            host_path = "C:/FindAndFixMe"
+            
+    # 3. 경로 포맷 정규화
+    p = host_path.replace("\\", "/")
+    
+    # WSL /mnt/c/ 등 접두사 정규화
+    if p.startswith("/mnt/"):
+        parts = p.split("/")
+        if len(parts) > 2:
+            drive = parts[2].lower()
+            p = f"/{drive}/" + "/".join(parts[3:])
+            
+    # Docker Desktop mnt 호스트 경로 정규화 (예: /run/desktop/mnt/host/c/ 또는 /host_mnt/c/)
+    for mnt_prefix in ["/run/desktop/mnt/host/", "/host_mnt/"]:
+        if p.startswith(mnt_prefix):
+            p = "/" + p[len(mnt_prefix):]
+            break
+
+    # 드라이브 문자(예: C:/...)를 /c/... 형태로 변환
+    if len(p) >= 2 and p[0].isalpha() and p[1] == ":":
+        drive = p[0].lower()
+        p = f"/{drive}{p[2:]}"
+        
+    return p.rstrip("/")
+
+
 def _get_host_absolute_path(container_abs_path: str) -> str:
     """
     백엔드 컨테이너 내부의 절대 경로(예: /app/temp_targets/23/...)를
-    호스트 윈도우 상의 물리적 절대 경로(예: /c/vscode/FindAndFixMe/temp_targets/23/...)로 변환합니다.
+    호스트 윈도우 상의 물리적 절대 경로로 변환합니다.
     DooD(Docker-out-of-Docker) 구동 시 -v 마운트 인자에 호스트 경로를 넣기 위해 필수적입니다.
     """
     p = container_abs_path.replace("\\", "/")
+    host_root = _get_host_project_root()
     # 만약 /app 으로 시작한다면, 호스트 상의 FindAndFixMe 루트 폴더로 치환
     if p.startswith("/app/"):
-        return "/c/vscode/FindAndFixMe/" + p[5:]
+        return f"{host_root}/" + p[5:]
     if p.startswith("/app"):
-        return "/c/vscode/FindAndFixMe"
-    # 만약 /mnt/c/ 로 시작한다면, C:/ 로 치환
-    if p.startswith("/mnt/c/"):
-        return "/c/" + p[7:]
+        return host_root
+    # 만약 /mnt/ 로 시작한다면 (WSL 드라이브 매핑 대응)
+    if p.startswith("/mnt/"):
+        parts = p.split("/")
+        if len(parts) > 2:
+            drive = parts[2].lower()
+            return f"/{drive}/" + "/".join(parts[3:])
     
     # 일반 드라이브 문자 경로(예: C:/...) 변환
     if len(p) >= 2 and p[0].isalpha() and p[1] == ":":
@@ -52,11 +115,29 @@ def _get_host_absolute_path(container_abs_path: str) -> str:
 
 def _get_container_internal_path(path: str) -> str:
     """
-    백엔드 내부 절대 경로(예: /mnt/c/vscode/FindAndFixMe/temp_targets/QuantLib_35/fuzzinterpolations_bin)를
-    도커 컨테이너가 마운트한 격리 디렉토리 기준 경로(예: /app/temp_targets/QuantLib_35/fuzzinterpolations_bin)로 정밀 변환합니다.
+    백엔드 내부 절대 경로를 도커 컨테이너가 마운트한 격리 디렉토리 기준 경로(/app/...)로 정밀 변환합니다.
     """
     p = path.replace("\\", "/")
-    for prefix in ["/mnt/c/vscode/FindAndFixMe", "/c/vscode/FindAndFixMe", "C:/vscode/FindAndFixMe", "c:/vscode/FindAndFixMe"]:
+    host_root = _get_host_project_root()
+    
+    prefixes = [host_root]
+    
+    # 만약 /c/FindAndFixMe 형태라면, 다른 표현들도 추가
+    if len(host_root) >= 3 and host_root[0] == "/" and host_root[2] == "/":
+        drive = host_root[1]
+        drive_upper = drive.upper()
+        drive_lower = drive.lower()
+        rest = host_root[2:]
+        prefixes.extend([
+            f"/mnt/{drive_lower}{rest}",
+            f"{drive_upper}:{rest}",
+            f"{drive_lower}:{rest}"
+        ])
+        
+    # 중복 제거 및 길이 역순 정렬 (가장 구체적인 매칭 우선)
+    prefixes = sorted(list(set(prefixes)), key=len, reverse=True)
+    
+    for prefix in prefixes:
         if p.startswith(prefix):
             return "/app" + p[len(prefix):]
     return p

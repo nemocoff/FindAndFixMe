@@ -13,6 +13,9 @@ RUN apt-get update && \
     libboost-all-dev \
     libssl-dev \
     libquantlib0-dev \
+    libclang-16-dev \
+    libclang-cpp16t64 \
+    libz3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 컨테이너 실행 시 기본 사용자 설정 (AFL++ 기본 권한 유지)
