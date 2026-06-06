@@ -6,4 +6,4 @@ requests
 google-generativeai
 streamlit-echarts==0.4.0 # V2 컴포넌트 충돌 방지를 위해 안정화 버전으로 고정
 z3-solver
-
+FPDF2
