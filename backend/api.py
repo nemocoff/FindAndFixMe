@@ -1033,23 +1033,53 @@ def _validation_task(task_id: int, mutant_id: int):
 
         orig_binary, mut_binary = program.get("binary_path", ""), mutant.get("mutant_binary_path", "")
         
-        crash_count, total_runs = 0, 0
+        killed_count, total_runs = 0, 0
         COMPARE_INPUTS = [b"\x00" * 8, b"\xff" * 8, b"test\n", b"0\n", b"-1\n"]
+
+        # [US-08] AFL++ 퍼저가 생성한 입력(queue, crashes, hangs)들을 로드
+        fuzzer_inputs = []
+        afl_out_dir = os.path.join(AFL_OUTPUT_BASE, str(mutant["program_id"]))
+        
+        from .data.trace_parser import _find_afl_dirs
+        for subdir_name in ["crashes", "hangs", "queue"]:
+            for dir_path in _find_afl_dirs(afl_out_dir, subdir_name):
+                if os.path.isdir(dir_path):
+                    for filename in os.listdir(dir_path):
+                        if filename.startswith(".") or filename.lower() == "readme.txt":
+                            continue
+                        file_path = os.path.join(dir_path, filename)
+                        if os.path.isfile(file_path):
+                            try:
+                                with open(file_path, "rb") as f:
+                                    fuzzer_inputs.append(f.read())
+                            except Exception:
+                                pass
+
+        # 퍼징 입력이 존재하면 사용하고, 없으면 정적 기본 입력으로 fallback
+        test_inputs = fuzzer_inputs if fuzzer_inputs else COMPARE_INPUTS
+
+        # 실행 속도 및 리소스 관리를 위해 최대 150개 입력으로 제한 (무작위 샘플링)
+        if len(test_inputs) > 150:
+            import random
+            random.seed(42)
+            test_inputs = random.sample(test_inputs, 150)
 
         if os.path.exists(orig_binary) and os.path.exists(mut_binary):
             mounts = {os.path.dirname(os.path.abspath(orig_binary)): "/target"}
             c_orig_bin = "/target/" + os.path.basename(orig_binary)
             c_mut_bin = "/target/" + os.path.basename(mut_binary)
 
-            for test_input in COMPARE_INPUTS:
+            for test_input in test_inputs:
                 try:
                     orig_res = _run_cmd_in_docker(["timeout", "5", c_orig_bin], mounts, timeout=10, stdin_data=test_input)
                     mut_res = _run_cmd_in_docker(["timeout", "5", c_mut_bin], mounts, timeout=10, stdin_data=test_input)
                     total_runs += 1
-                    if orig_res.returncode == 0 and mut_res.returncode != 0: crash_count += 1
+                    # 차이(differential) 검증: 두 바이너리의 실행 결과(리턴코드)가 다르면 결함 발견(killed)으로 판단
+                    if orig_res.returncode != mut_res.returncode:
+                        killed_count += 1
                 except subprocess.TimeoutExpired: pass
 
-        survival_rate = ((total_runs - crash_count) / total_runs * 100.0) if total_runs > 0 else (90.0 if os.path.exists(os.path.join(AFL_OUTPUT_BASE, str(mutant["program_id"]))) else 0.0)
+        survival_rate = ((total_runs - killed_count) / total_runs * 100.0) if total_runs > 0 else (90.0 if os.path.exists(afl_out_dir) else 0.0)
 
         # ── LLM 평가 (생존율 ≥ 95% 시) ───────────────────────────────
         llm_score = None
@@ -1083,3 +1113,41 @@ async def validate_mutant(mutant_id: int, background_tasks: BackgroundTasks):
 async def generate_report(mutant_id: int):
     if not db.get_mutant(mutant_id): raise HTTPException(status_code=404, detail="Mutant not found.")
     return Response(content=b"%PDF-1.4 FindAndFixMe Report", media_type="application/pdf")
+
+
+@app.get("/api/v1/mutations/history")
+async def get_mutations_history():
+    """[US-09] DB의 실측 결함 주입 및 검증 기록 목록을 반환"""
+    history_records = db.get_mutant_history()
+    result = []
+    import difflib
+    for rec in history_records:
+        pattern_name = PATTERN_REGISTRY.get(rec.get("injected_pattern_id"), "Unknown Pattern")
+        
+        # 원본과 뮤턴트 코드 간의 diff 계산
+        orig_code = rec.get("original_code", "")
+        mut_code = rec.get("mutated_code", "")
+        diff_lines = list(difflib.unified_diff(
+            orig_code.splitlines(keepends=True),
+            mut_code.splitlines(keepends=True),
+            fromfile='original',
+            tofile='mutated'
+        ))
+        diff_str = "".join(diff_lines)
+        
+        # 이력 리스트 렌더링에 적합하도록 필드 정규화
+        result.append({
+            "id": rec.get("mutant_id"),
+            "timestamp": rec.get("validated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "file": os.path.basename(rec.get("file_path") or "unknown.cpp"),
+            "location": rec.get("code_location") or "Unknown location",
+            "pattern": pattern_name,
+            "total_execs": db.get_trace_count(rec.get("program_id")) or 100,
+            "survival_rate": rec.get("survival_rate") if rec.get("survival_rate") is not None else 0.0,
+            "llm_score": f"{int(rec.get('llm_score'))}/10" if rec.get("llm_score") is not None else "N/A",
+            "llm_reasoning": rec.get("llm_rationale") or "평가 대기 중 또는 점수 없음",
+            "retry_count": 0,
+            "z3_condition": rec.get("constraint_expr") or "N/A",
+            "diff": diff_str
+        })
+    return result

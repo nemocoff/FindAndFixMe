@@ -267,3 +267,32 @@ class TraceDBManager:
     def get_trace_stats(self, program_id: int) -> dict:
         total = self.get_trace_count(program_id)
         return {"total": total}
+
+    def get_mutant_history(self) -> List[Dict[str, Any]]:
+        """[US-09] DB에 누적된 결함 주입 기록 및 검증 이력을 조회"""
+        with get_db_connection(self.db_path) as conn:
+            query = """
+                SELECT 
+                    m.id as mutant_id,
+                    m.program_id,
+                    m.node_id,
+                    m.injected_pattern_id,
+                    m.mutated_code,
+                    m.survival_rate,
+                    m.llm_score,
+                    m.llm_rationale,
+                    m.validated_at,
+                    t.file_path,
+                    t.original_code,
+                    t.source_file_path,
+                    c.code_location,
+                    s.constraint_expr,
+                    s.trigger_input
+                FROM MutantRecord m
+                JOIN TargetProgram t ON m.program_id = t.id
+                LEFT JOIN CornerCaseNode c ON m.node_id = c.id
+                LEFT JOIN SMTConstraint s ON m.node_id = s.node_id
+                ORDER BY m.id DESC
+            """
+            rows = conn.execute(query).fetchall()
+            return [dict(row) for row in rows]

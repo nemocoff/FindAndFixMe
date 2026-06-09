@@ -5,7 +5,7 @@ import pandas as pd
 from api_client import (
     upload_targets, compile_target, collect_traces, get_corner_cases, inject_mutation, 
     upload_github_target, validate_mutant, get_trace_tree, wait_for_github_import,
-    solve_smt
+    solve_smt, get_history
 )
 from components.trace_tree import render_trace_tree_and_table
 from components.diff_viewer import render_diff_viewer
@@ -275,90 +275,61 @@ def main() -> None:
         st.markdown("### 📚 Injection History Dashboard")
         st.caption("데이터베이스에 저장된 이전 결함 주입 및 검증 이력을 확인합니다.")
 
-        # 1. DB 연동 전 UI 테스트를 위한 가짜 데이터 (Mock Data)
-        mock_data = [
-        {
-            "id": 1, 
-            "timestamp": "2026-06-05 14:30:22", 
-            "file": "quantlibtestsuite.cpp", 
-            "location": "void testAmericanOption() Line 142",
-            "pattern": "CWE-190 Integer Overflow", 
-            "total_execs": 10000,
-            "survival_rate": 24.5, 
-            "llm_score": "8/10",
-            "llm_reasoning": "경계값 검증 로직이 누락되어 악의적인 정수 오버플로우 공격에 취약해졌으며, 기존 비즈니스 로직과 자연스럽게 융합되었습니다.",
-            "retry_count": 1,
-            "z3_condition": "(assert (and (> x 2147483647) (< y 0)))", 
-            "diff": "- int x = 0;\n+ int x = 2147483647;"
-        },
-        {
-            "id": 2, 
-            "timestamp": "2026-06-05 16:15:00", 
-            "file": "password_generator.c", 
-            "location": "generate_password() Line 45",
-            "pattern": "CWE-193 Boundary Condition", 
-            "total_execs": 10000,
-            "survival_rate": 8.2, 
-            "llm_score": "9/10",
-            "llm_reasoning": "배열 탐색 조건식의 미세한 변조로 Off-by-one 에러가 완벽하게 구현되었습니다.",
-            "retry_count": 2,
-            "z3_condition": "(assert (<= len 10))", 
-            "diff": "- for(int i=0; i<len; i++)\n+ for(int i=0; i<=len; i++)"
-        },
-        ]
-        df = pd.DataFrame(mock_data)
+        try:
+            db_records = get_history()
+        except Exception as e:
+            st.error(f"Failed to fetch history from database: {e}")
+            db_records = []
 
-        # 2. Master View (상단 요약 표)
-        # Streamlit의 dataframe selection 기능을 사용하여 행 클릭 이벤트를 활성화합니다.
-        st.markdown("##### 📌 Execution Records")
-        event = st.dataframe(
-            df[["timestamp", "file", "pattern", "survival_rate", "llm_score", "retry_count"]],
-            use_container_width=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            hide_index=True
-        )
-
-        # 3. Detail View (하단 상세 정보 렌더링)
-        selected_rows = event.selection.rows
-        if selected_rows:
-            # 표에서 특정 행이 클릭되었을 때
-            selected_idx = selected_rows[0]
-            selected_record = mock_data[selected_idx]
-
-            # st.markdown("---")
-            st.markdown(f"#### 🔍 세부 분석 결과: `{selected_record['file']}`")
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.info(f"**Pattern:** {selected_record['pattern']}")
-            with col2:
-                st.warning(f"**Survival Rate:** {selected_record['survival_rate']}%")
-            with col3:
-                st.success(f"**Gemini AI Score:** {selected_record['llm_score']}")
-
-            # 긴 텍스트 데이터들은 아래에 넓게 배치
-            st.markdown("##### 🎯 Z3 SMT Solver Trigger Condition")
-            st.code(selected_record['z3_condition'], language="lisp")
-
-            st.markdown("##### 💻 Code Diff")
-            st.code(selected_record['diff'], language="diff")
-            
-            # 1. PDF 생성 함수 호출 (바이트 데이터 받기)
-            pdf_bytes = create_pdf_report(selected_record)
-        
-            # 2. Streamlit 내장 다운로드 버튼 렌더링
-            st.download_button(
-                label="📄 Export to PDF (다운로드)",
-                data=bytes(pdf_bytes),  # bytearray를 bytes로 확실하게 변환
-                file_name=f"FindAndFixMe_Report_{selected_record['id']}.pdf",
-                mime="application/pdf",
-                type="primary"
-            )
-            
+        if not db_records:
+            st.info("데이터베이스에 결함 주입 이력이 없습니다. 파이프라인을 먼저 실행해 주세요.")
         else:
-            # 아무 행도 클릭하지 않았을 때의 안내 문구
-            st.info("👆 위 표에서 행을 클릭하면 상세한 트리거 조건과 Code Diff를 확인할 수 있습니다.")
+            df = pd.DataFrame(db_records)
+
+            # 2. Master View (상단 요약 표)
+            st.markdown("##### 📌 Execution Records")
+            event = st.dataframe(
+                df[["timestamp", "file", "pattern", "survival_rate", "llm_score", "retry_count"]],
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                hide_index=True
+            )
+
+            # 3. Detail View (하단 상세 정보 렌더링)
+            selected_rows = event.selection.rows
+            if selected_rows:
+                selected_idx = selected_rows[0]
+                selected_record = db_records[selected_idx]
+
+                st.markdown(f"#### 🔍 세부 분석 결과: `{selected_record['file']}`")
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.info(f"**Pattern:** {selected_record['pattern']}")
+                with col2:
+                    st.warning(f"**Survival Rate:** {selected_record['survival_rate']:.1f}%")
+                with col3:
+                    st.success(f"**Gemini AI Score:** {selected_record['llm_score']}")
+
+                st.markdown("##### 🎯 Z3 SMT Solver Trigger Condition")
+                st.code(selected_record['z3_condition'], language="lisp")
+
+                st.markdown("##### 💻 Code Diff")
+                st.code(selected_record['diff'], language="diff")
+                
+                pdf_bytes = create_pdf_report(selected_record)
+            
+                st.download_button(
+                    label="📄 Export to PDF (다운로드)",
+                    data=bytes(pdf_bytes),
+                    file_name=f"FindAndFixMe_Report_{selected_record['id']}.pdf",
+                    mime="application/pdf",
+                    type="primary"
+                )
+                
+            else:
+                st.info("👆 위 표에서 행을 클릭하면 상세한 트리거 조건과 Code Diff를 확인할 수 있습니다.")
 
 if __name__ == "__main__":
     main()
