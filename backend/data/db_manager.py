@@ -133,11 +133,18 @@ class TraceDBManager:
                     survival_rate REAL,
                     llm_score REAL,
                     llm_rationale TEXT,
+                    total_execs INTEGER,
                     validated_at TIMESTAMP,
                     FOREIGN KEY(program_id) REFERENCES TargetProgram(id),
                     FOREIGN KEY(node_id) REFERENCES CornerCaseNode(id)
                 )
             ''')
+
+            # migration: total_execs 컬럼 추가
+            try:
+                cursor.execute("ALTER TABLE MutantRecord ADD COLUMN total_execs INTEGER")
+            except Exception:
+                pass
 
             # 6. DependencyCache (빌드 바이너리 캐시 트래커)
             cursor.execute('''
@@ -220,13 +227,14 @@ class TraceDBManager:
     # ─────────────────────────────────────────────
     def update_mutant_validation(self, mutant_id: int, survival_rate: float,
                                  llm_score: Optional[float],
-                                 llm_rationale: Optional[str]) -> None:
+                                 llm_rationale: Optional[str],
+                                 total_execs: Optional[int] = None) -> None:
         with get_db_connection(self.db_path) as conn:
             conn.execute(
                 """UPDATE MutantRecord
-                   SET survival_rate=?, llm_score=?, llm_rationale=?, validated_at=CURRENT_TIMESTAMP
+                   SET survival_rate=?, llm_score=?, llm_rationale=?, total_execs=?, validated_at=CURRENT_TIMESTAMP
                    WHERE id=?""",
-                (survival_rate, llm_score, llm_rationale, mutant_id)
+                (survival_rate, llm_score, llm_rationale, total_execs, mutant_id)
             )
             conn.commit()
 
@@ -281,6 +289,7 @@ class TraceDBManager:
                     m.survival_rate,
                     m.llm_score,
                     m.llm_rationale,
+                    m.total_execs,
                     m.validated_at,
                     t.file_path,
                     t.original_code,

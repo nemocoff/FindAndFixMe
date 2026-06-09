@@ -1093,7 +1093,7 @@ def _validation_task(task_id: int, mutant_id: int):
             llm_score = None      # 실제 연동 전까지 None 유지
             llm_rationale = None
 
-        db.update_mutant_validation(mutant_id, survival_rate, llm_score, llm_rationale)
+        db.update_mutant_validation(mutant_id, survival_rate, llm_score, llm_rationale, total_runs)
         TASK_STATUS[task_id] = {"status": "completed", "result": {"survival_rate": survival_rate, "llm_score": llm_score}}
         print(f"[Validation Docker] mutant_id={mutant_id} survival_rate={survival_rate:.1f}%")
     except Exception as e:
@@ -1142,7 +1142,7 @@ async def get_mutations_history():
             "file": os.path.basename(rec.get("file_path") or "unknown.cpp"),
             "location": rec.get("code_location") or "Unknown location",
             "pattern": pattern_name,
-            "total_execs": db.get_trace_count(rec.get("program_id")) or 100,
+            "total_execs": rec.get("total_execs") or db.get_trace_count(rec.get("program_id")) or 100,
             "survival_rate": rec.get("survival_rate") if rec.get("survival_rate") is not None else 0.0,
             "llm_score": f"{int(rec.get('llm_score'))}/10" if rec.get("llm_score") is not None else "N/A",
             "llm_reasoning": rec.get("llm_rationale") or "평가 대기 중 또는 점수 없음",
