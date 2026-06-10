@@ -1,14 +1,15 @@
 import streamlit as st
 import requests
+import re
 from fpdf import FPDF
 import pandas as pd
 from api_client import (
     upload_targets, compile_target, collect_traces, get_corner_cases, inject_mutation, 
     upload_github_target, validate_mutant, get_trace_tree, wait_for_github_import,
-    solve_smt
+    solve_smt, get_history
 )
 from components.trace_tree import render_trace_tree_and_table
-from components.diff_viewer import render_diff_viewer
+from components.diff_viewer import render_diff_viewer, render_rich_diff_viewer
 
 API_BASE_URL = "http://localhost:8000/api/v1"
 
@@ -96,12 +97,24 @@ def create_pdf_report(record):
     # --- [섹션 1: 메타데이터 요약 (회색 배경 박스)] ---
     pdf.set_fill_color(245, 245, 245) # 연한 회색 지정
     pdf.set_font("D2Coding", size=11)
+
+    ts = record.get('timestamp', '기록 없음')
+    file_name = record.get('file', 'Unknown')
+    loc = record.get('location', '위치 미상')
+    pat = record.get('pattern', 'N/A')
+    retry = record.get('retry_count', 0)
+    surv = record.get('survival_rate', 0.0)
+    execs = record.get('total_execs', 0)
+    llm_score = record.get('llm_score', 'N/A')
+    llm_reasoning = record.get('llm_reasoning', '평가 사유가 데이터베이스에 없습니다.')
+    z3_cond = record.get('z3_condition', '조건 정보 없음')
+    diff = record.get('diff', 'Diff 정보 없음')
     
     # 높이 8짜리 셀들에 fill=True를 주어 배경색을 입힙니다.
-    pdf.cell(0, 8, f" 주입 일시   : {record['timestamp']}", ln=True, fill=True)
-    pdf.cell(0, 8, f" 타겟 파일   : {record['file']} ({record['location']})", ln=True, fill=True)
-    pdf.cell(0, 8, f" 주입 패턴   : {record['pattern']} (재시도: {record['retry_count']}회)", ln=True, fill=True)
-    pdf.cell(0, 8, f" 퍼저 생존율 : {record['survival_rate']}% (총 {record['total_execs']}회 실행)", ln=True, fill=True)
+    pdf.cell(0, 8, f" 주입 일시   : {ts}", ln=True, fill=True)
+    pdf.cell(0, 8, f" 타겟 파일   : {file_name} ({loc})", ln=True, fill=True)
+    pdf.cell(0, 8, f" 주입 패턴   : {pat} (재시도: {retry}회)", ln=True, fill=True)
+    pdf.cell(0, 8, f" 퍼저 생존율 : {surv}% (총 {execs}회 실행)", ln=True, fill=True)
     pdf.ln(8)
     
     # --- [구분선] ---
@@ -111,11 +124,11 @@ def create_pdf_report(record):
     
     # --- [섹션 2: Gemini 정성 평가] ---
     pdf.set_font("D2Coding", size=13)
-    pdf.cell(0, 10, f"🤖 AI 정성 평가 결과 (Score: {record['llm_score']})", ln=True)
+    pdf.cell(0, 10, f"🤖 AI 정성 평가 결과 (Score: {llm_score})", ln=True)
     
     pdf.set_font("D2Coding", size=11)
     # multi_cell로 긴 평가 사유를 줄바꿈하여 출력합니다.
-    pdf.multi_cell(0, 8, f"평가 사유: {record['llm_reasoning']}")
+    pdf.multi_cell(0, 8, f"평가 사유: {llm_reasoning}")
     pdf.ln(5)
     
     # --- [구분선] ---
@@ -126,18 +139,73 @@ def create_pdf_report(record):
     pdf.set_font("D2Coding", size=13)
     pdf.cell(0, 10, "🎯 Z3 SMT Solver Trigger Condition", ln=True)
     pdf.set_font("D2Coding", size=10)
-    pdf.multi_cell(0, 6, record['z3_condition'])
+    pdf.multi_cell(0, 6, z3_cond)
     pdf.ln(5)
     
     pdf.line(10, pdf.get_y(), 200, pdf.get_y())
     pdf.ln(5)
 
-    pdf.set_font("D2Coding", size=13)
-    pdf.cell(0, 10, "💻 Code Diff", ln=True)
-    pdf.set_font("D2Coding", size=10)
-    pdf.multi_cell(0, 6, record['diff'])
+    # --- [섹션 4: Code Diff (Hunk 배너 가공 버전)] ---
+    import re
     
+    pdf.set_font("D2Coding", size=13)
+    pdf.set_x(10)
+    pdf.cell(pdf.epw, 10, "💻 Code Diff (Unified)")
+    pdf.ln(8)
+    
+    # 소스코드용 폰트 크기 설정
+    pdf.set_font("D2Coding", size=8.5)
+    
+    raw_diff = record.get('diff', '')
+    for line in raw_diff.splitlines():
+        clean_line = line.replace('\xa0', ' ').replace('\t', '    ')
+        
+        if clean_line.startswith('+'):
+            pdf.set_text_color(40, 167, 69)     # 진한 초록색 (추가)
+            display_line = f"  {clean_line}"
+            pdf.set_x(10)
+            pdf.multi_cell(pdf.epw, 4.5, display_line)
+            
+        elif clean_line.startswith('-'):
+            pdf.set_text_color(220, 53, 69)    # 진한 빨간색 (삭제)
+            display_line = f"  {clean_line}"
+            pdf.set_x(10)
+            pdf.multi_cell(pdf.epw, 4.5, display_line)
+            
+        elif clean_line.startswith('@@'):
+            # 💡 보라색 raw 기호를 깔끔한 중앙 배너로 대폭 탈바꿈합니다.
+            pdf.ln(3)                          # 위쪽 여백 공백 분리
+            pdf.set_fill_color(243, 235, 250)  # 은은한 연보라색 배경 박스 칠하기
+            pdf.set_text_color(111, 66, 193)   # 글자색은 보라색 고정
+            pdf.set_font("D2CodingBold", size=9) # 강조용 볼드체 변환
+            
+            # @@ -81,7 ... 에서 시작 라인 번호(81)를 역산해 냅니다.
+            match = re.search(r'@@ -(\d+)', clean_line)
+            if match:
+                hunk_banner = f"[ 코드 변경 구간 : Line {match.group(1)} 부근 ]"
+            else:
+                hunk_banner = f"[ {clean_line} ]"
+                
+            pdf.set_x(10)
+            # 가로폭을 꽉 채운 6mm 높이의 중앙 정렬 텍스트 박스를 그립니다.
+            pdf.cell(pdf.epw, 6, hunk_banner, ln=True, fill=True, align='C')
+            pdf.ln(3)                          # 아래쪽 여백
+            pdf.set_font("D2Coding", size=8.5) # 다시 일반 소스코드 폰트로 원복
+            
+        elif clean_line.startswith('---') or clean_line.startswith('+++'):
+            # original, mutated 파일 헤더 텍스트는 리포트 가독성을 위해 과감히 생략합니다.
+            continue
+            
+        else:
+            pdf.set_text_color(120, 120, 120)  # 회색 (변화 없는 본문)
+            display_line = f"  {clean_line}"
+            pdf.set_x(10)
+            pdf.multi_cell(pdf.epw, 4.5, display_line)
+            
+    pdf.set_text_color(0, 0, 0)
     return pdf.output()
+
+
 
 def main() -> None:
     """
@@ -275,90 +343,69 @@ def main() -> None:
         st.markdown("### 📚 Injection History Dashboard")
         st.caption("데이터베이스에 저장된 이전 결함 주입 및 검증 이력을 확인합니다.")
 
-        # 1. DB 연동 전 UI 테스트를 위한 가짜 데이터 (Mock Data)
-        mock_data = [
-        {
-            "id": 1, 
-            "timestamp": "2026-06-05 14:30:22", 
-            "file": "quantlibtestsuite.cpp", 
-            "location": "void testAmericanOption() Line 142",
-            "pattern": "CWE-190 Integer Overflow", 
-            "total_execs": 10000,
-            "survival_rate": 24.5, 
-            "llm_score": "8/10",
-            "llm_reasoning": "경계값 검증 로직이 누락되어 악의적인 정수 오버플로우 공격에 취약해졌으며, 기존 비즈니스 로직과 자연스럽게 융합되었습니다.",
-            "retry_count": 1,
-            "z3_condition": "(assert (and (> x 2147483647) (< y 0)))", 
-            "diff": "- int x = 0;\n+ int x = 2147483647;"
-        },
-        {
-            "id": 2, 
-            "timestamp": "2026-06-05 16:15:00", 
-            "file": "password_generator.c", 
-            "location": "generate_password() Line 45",
-            "pattern": "CWE-193 Boundary Condition", 
-            "total_execs": 10000,
-            "survival_rate": 8.2, 
-            "llm_score": "9/10",
-            "llm_reasoning": "배열 탐색 조건식의 미세한 변조로 Off-by-one 에러가 완벽하게 구현되었습니다.",
-            "retry_count": 2,
-            "z3_condition": "(assert (<= len 10))", 
-            "diff": "- for(int i=0; i<len; i++)\n+ for(int i=0; i<=len; i++)"
-        },
-        ]
-        df = pd.DataFrame(mock_data)
+        try:
+            db_records = get_history()
+        except Exception as e:
+            st.error(f"Failed to fetch history from database: {e}")
+            db_records = []
 
-        # 2. Master View (상단 요약 표)
-        # Streamlit의 dataframe selection 기능을 사용하여 행 클릭 이벤트를 활성화합니다.
-        st.markdown("##### 📌 Execution Records")
-        event = st.dataframe(
-            df[["timestamp", "file", "pattern", "survival_rate", "llm_score", "retry_count"]],
-            use_container_width=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            hide_index=True
-        )
-
-        # 3. Detail View (하단 상세 정보 렌더링)
-        selected_rows = event.selection.rows
-        if selected_rows:
-            # 표에서 특정 행이 클릭되었을 때
-            selected_idx = selected_rows[0]
-            selected_record = mock_data[selected_idx]
-
-            # st.markdown("---")
-            st.markdown(f"#### 🔍 세부 분석 결과: `{selected_record['file']}`")
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.info(f"**Pattern:** {selected_record['pattern']}")
-            with col2:
-                st.warning(f"**Survival Rate:** {selected_record['survival_rate']}%")
-            with col3:
-                st.success(f"**Gemini AI Score:** {selected_record['llm_score']}")
-
-            # 긴 텍스트 데이터들은 아래에 넓게 배치
-            st.markdown("##### 🎯 Z3 SMT Solver Trigger Condition")
-            st.code(selected_record['z3_condition'], language="lisp")
-
-            st.markdown("##### 💻 Code Diff")
-            st.code(selected_record['diff'], language="diff")
-            
-            # 1. PDF 생성 함수 호출 (바이트 데이터 받기)
-            pdf_bytes = create_pdf_report(selected_record)
-        
-            # 2. Streamlit 내장 다운로드 버튼 렌더링
-            st.download_button(
-                label="📄 Export to PDF (다운로드)",
-                data=bytes(pdf_bytes),  # bytearray를 bytes로 확실하게 변환
-                file_name=f"FindAndFixMe_Report_{selected_record['id']}.pdf",
-                mime="application/pdf",
-                type="primary"
-            )
-            
+        if not db_records:
+            st.info("데이터베이스에 결함 주입 이력이 없습니다. 파이프라인을 먼저 실행해 주세요.")
         else:
-            # 아무 행도 클릭하지 않았을 때의 안내 문구
-            st.info("👆 위 표에서 행을 클릭하면 상세한 트리거 조건과 Code Diff를 확인할 수 있습니다.")
+            df = pd.DataFrame(db_records)
+
+            desired_columns = ["timestamp", "file", "pattern", "survival_rate", "llm_score", "retry_count"]
+            display_columns = [col for col in desired_columns if col in df.columns]
+            
+            # 2. Master View (상단 요약 표)
+            st.markdown("##### 📌 Execution Records")
+            event = st.dataframe(
+                df[display_columns],
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                hide_index=True
+            )
+
+            # 3. Detail View (하단 상세 정보 렌더링)
+            selected_rows = event.selection.rows
+            if selected_rows:
+                selected_idx = selected_rows[0]
+                selected_record = db_records[selected_idx]
+
+                st.markdown(f"#### 🔍 세부 분석 결과: `{selected_record.get('file', 'Unknown')}`")
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.info(f"**Pattern:** {selected_record.get('pattern', 'N/A')}")
+                with col2:
+                    st.warning(f"**Survival Rate:** {selected_record.get('survival_rate', 0.0):.1f}%")
+                with col3:
+                    st.success(f"**Gemini AI Score:** {selected_record.get('llm_score', 'N/A')}")
+
+                st.markdown("##### 🎯 Z3 SMT Solver Trigger Condition")
+                st.code(selected_record.get('z3_condition', '조건 정보 없음'), language="lisp")
+
+                st.markdown("##### 💻 Code Diff (Side-by-Side)")
+                
+                raw_diff = selected_record.get('diff', '')
+                if raw_diff:
+                    render_rich_diff_viewer(raw_diff)
+                else:
+                    st.info("표시할 Diff 데이터가 없습니다.")
+                
+                pdf_bytes = create_pdf_report(selected_record)
+            
+                st.download_button(
+                    label="📄 Export to PDF (다운로드)",
+                    data=bytes(pdf_bytes),
+                    file_name=f"FindAndFixMe_Report_{selected_record.get('id', 'Unknown')}.pdf",
+                    mime="application/pdf",
+                    type="primary"
+                )
+                
+            else:
+                st.info("👆 위 표에서 행을 클릭하면 상세한 트리거 조건과 Code Diff를 확인할 수 있습니다.")
 
 if __name__ == "__main__":
     main()

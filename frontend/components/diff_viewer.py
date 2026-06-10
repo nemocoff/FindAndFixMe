@@ -1,4 +1,6 @@
 import streamlit as st
+import json
+import streamlit.components.v1 as components
 
 def render_diff_viewer(old_code: str, new_code: str, trigger_input: str = ""):
     """
@@ -36,3 +38,41 @@ def render_diff_viewer(old_code: str, new_code: str, trigger_input: str = ""):
     st.code(diff_text, language="diff")
 
     st.success("✅ 결함 주입 무결성 검증 완료: AST 구조가 붕괴되지 않았으며 정상 컴파일이 가능합니다.")
+
+def render_rich_diff_viewer(raw_diff_string):
+    """diff2html.js를 사용하여 GitHub 스타일의 미려한 Diff 뷰어를 렌더링합니다."""
+    
+    # C++ 코드 내의 따옴표나 줄바꿈이 JS 문법을 깨뜨리지 않도록 안전하게 인코딩합니다.
+    safe_diff = json.dumps(raw_diff_string)
+    
+    html_template = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css" />
+        <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/diff2html/bundles/js/diff2html-ui.min.js"></script>
+    </head>
+    <body style="margin: 0; font-family: sans-serif;">
+        <div id="diff-ui"></div>
+        <script>
+            document.addEventListener('DOMContentLoaded', function () {{
+                var diffString = {safe_diff};
+                var targetElement = document.getElementById('diff-ui');
+                var configuration = {{
+                    drawFileList: false,
+                    matching: 'lines',
+                    outputFormat: 'side-by-side', // 좌우 분할 모드 (위아래로 보려면 'line-by-line'으로 변경)
+                    synchronisedScroll: true,     // 양쪽 스크롤 동기화
+                    highlight: true,
+                    renderNothingWhenEmpty: false,
+                }};
+                var diff2htmlUi = new Diff2HtmlUI(targetElement, diffString, configuration);
+                diff2htmlUi.draw();
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    
+    # 생성된 HTML을 Streamlit 화면에 높이 500px로 렌더링 (스크롤 가능)
+    components.html(html_template, height=500, scrolling=True)
