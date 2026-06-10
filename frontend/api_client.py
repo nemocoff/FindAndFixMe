@@ -167,3 +167,7 @@ def run_github_pipeline(repo_url, target_file):
     print(f"[Git] Waiting for background clone and compiles for program {prog_id}...")
     wait_for_github_import(prog_id)
     return _run_pipeline_tail(prog_id)
+
+def get_history():
+    """[US-09] 백엔드에서 결함 주입 실측 이력 데이터를 조회"""
+    return _make_request("GET", f"{API_BASE_URL}/mutations/history")
