@@ -1013,7 +1013,10 @@ def _perform_injection(req: MutationInjectRequest):
         )
     mutant_binary_path = mutant_bin
 
-    mutant_id = db.insert_mutant(program_id, actual_node_id, req.pattern_id, original_code, mutated_code, mutant_binary_path)
+    mutant_id = db.insert_mutant(
+        program_id, actual_node_id, req.pattern_id, original_code, mutated_code, mutant_binary_path,
+        injected_pattern_name=combined_pattern_name
+    )
     return {
         "status": "success", 
         "mutant_id": mutant_id, 
@@ -1122,7 +1125,7 @@ async def get_mutations_history():
     result = []
     import difflib
     for rec in history_records:
-        pattern_name = PATTERN_REGISTRY.get(rec.get("injected_pattern_id"), "Unknown Pattern")
+        pattern_name = rec.get("injected_pattern_name") or PATTERN_REGISTRY.get(rec.get("injected_pattern_id"), "Unknown Pattern")
         
         # 원본과 뮤턴트 코드 간의 diff 계산
         orig_code = rec.get("original_code", "")
@@ -1138,7 +1141,7 @@ async def get_mutations_history():
         # 이력 리스트 렌더링에 적합하도록 필드 정규화
         result.append({
             "id": rec.get("mutant_id"),
-            "timestamp": rec.get("validated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": rec.get("created_at") or rec.get("validated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "file": os.path.basename(rec.get("file_path") or "unknown.cpp"),
             "location": rec.get("code_location") or "Unknown location",
             "pattern": pattern_name,

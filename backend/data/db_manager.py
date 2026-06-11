@@ -135,6 +135,8 @@ class TraceDBManager:
                     llm_rationale TEXT,
                     total_execs INTEGER,
                     validated_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    injected_pattern_name TEXT,
                     FOREIGN KEY(program_id) REFERENCES TargetProgram(id),
                     FOREIGN KEY(node_id) REFERENCES CornerCaseNode(id)
                 )
@@ -143,6 +145,16 @@ class TraceDBManager:
             # migration: total_execs 컬럼 추가
             try:
                 cursor.execute("ALTER TABLE MutantRecord ADD COLUMN total_execs INTEGER")
+            except Exception:
+                pass
+            # migration: created_at 컬럼 추가
+            try:
+                cursor.execute("ALTER TABLE MutantRecord ADD COLUMN created_at TIMESTAMP")
+            except Exception:
+                pass
+            # migration: injected_pattern_name 컬럼 추가
+            try:
+                cursor.execute("ALTER TABLE MutantRecord ADD COLUMN injected_pattern_name TEXT")
             except Exception:
                 pass
 
@@ -206,7 +218,8 @@ class TraceDBManager:
     # ─────────────────────────────────────────────
     def insert_mutant(self, program_id: int, node_id: Optional[int], pattern_id: int,
                       original_code: str, mutated_code: str,
-                      mutant_binary_path: str = "") -> int:
+                      mutant_binary_path: str = "",
+                      injected_pattern_name: str = "") -> int:
         """
         Integrity Rule 1: original == mutated 이면 ValueError.
         Integrity Rule 2: pattern_id 1~6 범위는 DB CHECK가 강제.
@@ -216,8 +229,8 @@ class TraceDBManager:
         with get_db_connection(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO MutantRecord (program_id, node_id, injected_pattern_id, mutated_code, mutant_binary_path) VALUES (?,?,?,?,?)",
-                (program_id, node_id, pattern_id, mutated_code, mutant_binary_path)
+                "INSERT INTO MutantRecord (program_id, node_id, injected_pattern_id, mutated_code, mutant_binary_path, injected_pattern_name, created_at) VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                (program_id, node_id, pattern_id, mutated_code, mutant_binary_path, injected_pattern_name)
             )
             conn.commit()
             return cursor.lastrowid
@@ -291,6 +304,8 @@ class TraceDBManager:
                     m.llm_rationale,
                     m.total_execs,
                     m.validated_at,
+                    m.created_at,
+                    m.injected_pattern_name,
                     t.file_path,
                     t.original_code,
                     t.source_file_path,
