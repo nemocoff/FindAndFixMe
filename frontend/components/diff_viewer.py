@@ -42,7 +42,6 @@ def render_diff_viewer(old_code: str, new_code: str, trigger_input: str = ""):
 def render_rich_diff_viewer(raw_diff_string):
     """diff2html.js를 사용하여 GitHub 스타일의 미려한 Diff 뷰어를 렌더링합니다."""
     
-    # C++ 코드 내의 따옴표나 줄바꿈이 JS 문법을 깨뜨리지 않도록 안전하게 인코딩합니다.
     safe_diff = json.dumps(raw_diff_string)
     
     html_template = f"""
@@ -51,6 +50,22 @@ def render_rich_diff_viewer(raw_diff_string):
     <head>
         <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css" />
         <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/diff2html/bundles/js/diff2html-ui.min.js"></script>
+        
+        <style>
+            /* 1. 회원님이 찾으신 CSS 루트 변수 무력화 */
+            :root, body, .d2h-wrapper, #diff-ui {{
+                --d2h-del-highlight-bg-color: transparent !important;
+                --d2h-ins-highlight-bg-color: transparent !important;
+            }}
+            
+            /* 2. 회원님이 찾으신 태그 직접 무력화 */
+            .d2h-code-line del, .d2h-code-side-line del,
+            .d2h-code-line ins, .d2h-code-side-line ins {{
+                background-color: transparent !important;
+                background: none !important;
+                color: inherit !important;
+            }}
+        </style>
     </head>
     <body style="margin: 0; font-family: sans-serif;">
         <div id="diff-ui"></div>
@@ -61,11 +76,12 @@ def render_rich_diff_viewer(raw_diff_string):
                 var configuration = {{
                     drawFileList: false,
                     matching: 'lines',
-                    outputFormat: 'side-by-side', // 좌우 분할 모드 (위아래로 보려면 'line-by-line'으로 변경)
-                    synchronisedScroll: true,     // 양쪽 스크롤 동기화
+                    outputFormat: 'side-by-side',
+                    synchronisedScroll: true,     
                     highlight: true,
                     renderNothingWhenEmpty: false,
                 }};
+                
                 var diff2htmlUi = new Diff2HtmlUI(targetElement, diffString, configuration);
                 diff2htmlUi.draw();
             }});
@@ -74,5 +90,5 @@ def render_rich_diff_viewer(raw_diff_string):
     </html>
     """
     
-    # 생성된 HTML을 Streamlit 화면에 높이 500px로 렌더링 (스크롤 가능)
+    # Streamlit 컴포넌트로 렌더링
     components.html(html_template, height=500, scrolling=True)

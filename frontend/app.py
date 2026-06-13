@@ -146,8 +146,6 @@ def create_pdf_report(record):
     pdf.ln(5)
 
     # --- [섹션 4: Code Diff (Hunk 배너 가공 버전)] ---
-    import re
-    
     pdf.set_font("D2Coding", size=13)
     pdf.set_x(10)
     pdf.cell(pdf.epw, 10, "💻 Code Diff (Unified)")
@@ -156,8 +154,24 @@ def create_pdf_report(record):
     # 소스코드용 폰트 크기 설정
     pdf.set_font("D2Coding", size=8.5)
     
-    raw_diff = record.get('diff', '')
-    for line in raw_diff.splitlines():
+    hunk_patterns = {}
+    current_hunk_line = None
+    
+    for line in diff.splitlines():
+        hunk_match = re.search(r'@@ -(\d+)', line)
+        if hunk_match:
+            current_hunk_line = hunk_match.group(1)
+            # 단일 값이 아닌 Set()으로 초기화하여 여러 개를 담을 준비를 합니다.
+            if current_hunk_line not in hunk_patterns:
+                hunk_patterns[current_hunk_line] = set()
+            
+        elif current_hunk_line and line.startswith('+'):
+            cwe_match = re.search(r'Injected\s+(CWE-\d+)', line)
+            if cwe_match:
+                # 💡 해당 구간의 Set 바구니에 발견된 패턴을 계속 추가(add)합니다.
+                hunk_patterns[current_hunk_line].add(cwe_match.group(1))
+
+    for line in diff.splitlines():
         clean_line = line.replace('\xa0', ' ').replace('\t', '    ')
         
         if clean_line.startswith('+'):
@@ -173,24 +187,76 @@ def create_pdf_report(record):
             pdf.multi_cell(pdf.epw, 4.5, display_line)
             
         elif clean_line.startswith('@@'):
-            # 💡 보라색 raw 기호를 깔끔한 중앙 배너로 대폭 탈바꿈합니다.
-            pdf.ln(3)                          # 위쪽 여백 공백 분리
-            pdf.set_fill_color(243, 235, 250)  # 은은한 연보라색 배경 박스 칠하기
-            pdf.set_text_color(111, 66, 193)   # 글자색은 보라색 고정
-            pdf.set_font("D2CodingBold", size=9) # 강조용 볼드체 변환
+            pdf.ln(3)                          
             
-            # @@ -81,7 ... 에서 시작 라인 번호(81)를 역산해 냅니다.
             match = re.search(r'@@ -(\d+)', clean_line)
             if match:
-                hunk_banner = f"[ 코드 변경 구간 : Line {match.group(1)} 부근 ]"
+                line_num = match.group(1)
+                local_patterns_set = hunk_patterns.get(line_num, set())
+                
+                cwe_list = sorted(local_patterns_set) if local_patterns_set else []
+                if not cwe_list:
+                    db_pattern = record.get('pattern', 'Unknown Pattern')
+                    db_cwe_match = re.search(r'(CWE-\d+)', db_pattern)
+                    cwe_str = db_cwe_match.group(1) if db_cwe_match else db_pattern
+                    cwe_list = [cwe_str]
+
+                # 💡 1. 텍스트를 조각(Chunk) 단위로 쪼개서 리스트에 담습니다. (HTML 사용 안 함!)
+                chunks = [{"text": f"[ 코드 변경 구간 : Line {line_num} 부근  |  ", "url": ""}]
+                
+                for i, cwe in enumerate(cwe_list):
+                    cwe_num_match = re.search(r'CWE-(\d+)', cwe)
+                    url = f"https://cwe.mitre.org/data/definitions/{cwe_num_match.group(1)}.html" if cwe_num_match else ""
+                    
+                    # 결함 번호 조각 (링크 있음)
+                    chunks.append({"text": cwe, "url": url})
+                    
+                    # 쉼표 조각 (링크 없음)
+                    if i < len(cwe_list) - 1:
+                        chunks.append({"text": ", ", "url": ""})
+                        
+                # 닫는 괄호 조각 (링크 없음)
+                chunks.append({"text": " ]", "url": ""})
+                
+                # 💡 2. 전체 텍스트 길이를 계산하여 완벽한 중앙 X 좌표 도출
+                pdf.set_font("D2CodingBold", size=9)
+                total_width = sum(pdf.get_string_width(chunk["text"]) for chunk in chunks)
+                current_x = 10 + (pdf.epw - total_width) / 2
+                
+                # 💡 3. 캔버스 위에 연보라색 배경 박스를 직접 그립니다.
+                start_y = pdf.get_y()
+                pdf.set_fill_color(243, 235, 250)
+                pdf.rect(10, start_y, pdf.epw, 6, style='F')
+                
+                # 💡 4. 조각들을 중앙 좌표부터 가로로 쭉 이어 붙입니다.
+                pdf.set_y(start_y + 1) # 세로 중앙 정렬 미세조정
+                pdf.set_text_color(111, 66, 193) # 전체 텍스트 보라색 고정
+                
+                for chunk in chunks:
+                    pdf.set_x(current_x)
+                    chunk_width = pdf.get_string_width(chunk["text"])
+                    
+                    # cell 함수에 link 파라미터를 주면 밑줄 없이 투명한 클릭 영역만 생성됩니다!
+                    if chunk["url"]:
+                        pdf.cell(chunk_width, 4, chunk["text"], link=chunk["url"])
+                    else:
+                        pdf.cell(chunk_width, 4, chunk["text"])
+                        
+                    current_x += chunk_width # 다음 조각을 위해 X 좌표를 글자 폭만큼 이동
+                    
+                # 5. 다음 코드 출력을 위해 Y 좌표를 배너 아래로 내립니다.
+                pdf.set_y(start_y + 8)
+                
             else:
                 hunk_banner = f"[ {clean_line} ]"
+                pdf.set_x(10)
+                pdf.set_fill_color(243, 235, 250)
+                pdf.set_text_color(111, 66, 193)
+                pdf.set_font("D2CodingBold", size=9)
+                pdf.cell(pdf.epw, 6, hunk_banner, ln=True, fill=True, align='C')
+                pdf.ln(3)
                 
-            pdf.set_x(10)
-            # 가로폭을 꽉 채운 6mm 높이의 중앙 정렬 텍스트 박스를 그립니다.
-            pdf.cell(pdf.epw, 6, hunk_banner, ln=True, fill=True, align='C')
-            pdf.ln(3)                          # 아래쪽 여백
-            pdf.set_font("D2Coding", size=8.5) # 다시 일반 소스코드 폰트로 원복
+            pdf.set_font("D2Coding", size=8.5)
             
         elif clean_line.startswith('---') or clean_line.startswith('+++'):
             # original, mutated 파일 헤더 텍스트는 리포트 가독성을 위해 과감히 생략합니다.
@@ -364,7 +430,8 @@ def main() -> None:
                 use_container_width=True,
                 on_select="rerun",
                 selection_mode="single-row",
-                hide_index=True
+                hide_index=True,
+                key="history_master_table"
             )
 
             # 3. Detail View (하단 상세 정보 렌더링)
