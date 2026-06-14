@@ -110,10 +110,18 @@ def create_pdf_report(record):
     z3_cond = record.get('z3_condition', '조건 정보 없음')
     diff = record.get('diff', 'Diff 정보 없음')
     
+    pat_list = [p.strip() for p in pat.split('+')] if isinstance(pat, str) else [str(pat)]
+    
     # 높이 8짜리 셀들에 fill=True를 주어 배경색을 입힙니다.
     pdf.cell(0, 8, f" 주입 일시   : {ts}", ln=True, fill=True)
     pdf.cell(0, 8, f" 타겟 파일   : {file_name} ({loc})", ln=True, fill=True)
-    pdf.cell(0, 8, f" 주입 패턴   : {pat} (재시도: {retry}회)", ln=True, fill=True)
+    pdf.cell(0, 8, f" 주입 패턴   : {pat_list[0]}", ln=True, fill=True)
+
+    if len(pat_list) > 1:
+            for p in pat_list[1:]:
+                pdf.cell(0, 8, f"               {p}", ln=True, fill=True)
+
+    pdf.cell(0, 8, f" 주입 재시도 : {retry}회", ln=True, fill=True)
     pdf.cell(0, 8, f" 퍼저 생존율 : {surv}% (총 {execs}회 실행)", ln=True, fill=True)
     pdf.ln(8)
     
@@ -420,7 +428,23 @@ def main() -> None:
         else:
             df = pd.DataFrame(db_records)
 
-            desired_columns = ["timestamp", "file", "pattern", "survival_rate", "llm_score", "retry_count"]
+            def format_pattern_list(x):
+                if not isinstance(x, str):
+                    return []
+                
+                # 원본 패턴 리스트
+                p_list = [p.strip() for p in x.split('+')]
+                
+                # 🚨 패턴이 2개를 초과하면, 앞의 2개만 남기고 요약 배지를 추가합니다.
+                if len(p_list) > 2:
+                    return p_list[:2] + [f"... (+{len(p_list)-2} more)"]
+                return p_list
+        
+            # 데이터프레임에 적용
+            if "pattern" in df.columns:
+                df["pattern_list"] = df["pattern"].apply(format_pattern_list)
+
+            desired_columns = ["timestamp", "file", "pattern_list", "survival_rate", "llm_score", "retry_count"]
             display_columns = [col for col in desired_columns if col in df.columns]
             
             # 2. Master View (상단 요약 표)
@@ -431,7 +455,10 @@ def main() -> None:
                 on_select="rerun",
                 selection_mode="single-row",
                 hide_index=True,
-                key="history_master_table"
+                key="history_master_table",
+                column_config={
+                    "pattern_list": st.column_config.ListColumn("Injected Patterns", width="large"),
+                }
             )
 
             # 3. Detail View (하단 상세 정보 렌더링)
@@ -444,10 +471,24 @@ def main() -> None:
 
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.info(f"**Pattern:** {selected_record.get('pattern', 'N/A')}")
+                    st.caption("🛡️ **Injected Patterns**")
+                    raw_pattern = selected_record.get('pattern', 'N/A')
+                    
+                    if raw_pattern != 'N/A':
+                        pattern_list = [p.strip() for p in raw_pattern.split('+')]
+                        
+                        # 💡 핵심: st.expander를 사용해 드롭다운 토글을 만듭니다.
+                        # expanded=False 로 두면 기본적으로 접혀 있어서 세 단의 높이가 예쁘게 맞습니다.
+                        with st.expander(f"{len(pattern_list)} Injected Patterns", expanded=False):
+                            for p in pattern_list:
+                                st.code(p, language="plaintext")
+                    else:
+                        st.info("N/A")
                 with col2:
+                    st.caption("📈 **Survival Rate**")
                     st.warning(f"**Survival Rate:** {selected_record.get('survival_rate', 0.0):.1f}%")
                 with col3:
+                    st.caption("🤖 **Gemini AI Score**")
                     st.success(f"**Gemini AI Score:** {selected_record.get('llm_score', 'N/A')}")
 
                 st.markdown("##### 🎯 Z3 SMT Solver Trigger Condition")
