@@ -292,10 +292,10 @@ def main() -> None:
             0: "Auto Detect (Find any applicable pattern)",
             1: "CWE-190 Integer Overflow",
             2: "CWE-193 Boundary Condition Error",
-            3: "CWE-476 NULL Pointer Dereference",
-            4: "CWE-122 Heap Buffer Overflow",
-            5: "CWE-416 Use After Free",
-            6: "CWE-401 Memory Leak"
+            3: "CWE-390 Detection of Error Condition Without Action",
+            4: "CWE-401 Memory Leak",
+            5: "CWE-476 NULL Pointer Dereference",
+            6: "CWE-682 Incorrect Calculation"
         }
         selected_pattern_id = 0
         
@@ -312,6 +312,7 @@ def main() -> None:
                 if st.button("Run Full Pipeline", type="primary"):
                     st.session_state["analysis_result"] = None # 이전 결과 초기화
                     st.session_state["validation_results"] = {}
+                    st.session_state["history_data"] = None
                     try:
                         with st.status("Running FindAndFixMe Pipeline...", expanded=True) as status:
                             st.write("Uploading files to server...")
@@ -336,6 +337,7 @@ def main() -> None:
                 if st.button("Import and Run Pipeline", type="primary"):
                     st.session_state["analysis_result"] = None # 이전 결과 초기화
                     st.session_state["validation_results"] = {}
+                    st.session_state["history_data"] = None
                     try:
                         with st.status("Running FindAndFixMe Github Pipeline...", expanded=True) as status:
                             st.write("Cloning repo and compiling dependencies in background...")
@@ -393,6 +395,7 @@ def main() -> None:
                                     val_res = validate_mutant(m_id, wait=True)
                                     # 결과를 세션 상태에 저장하여 화면 리렌더링 시에도 유지
                                     st.session_state["validation_results"][m_id] = val_res
+                                    st.session_state["history_data"] = None
                                     st.rerun() # 화면 즉시 새로고침하여 결과 표시
                                 except Exception as e:
                                     st.error(f"Validation Error: {e}")
@@ -409,11 +412,24 @@ def main() -> None:
         st.markdown("### 📚 Injection History Dashboard")
         st.caption("데이터베이스에 저장된 이전 결함 주입 및 검증 이력을 확인합니다.")
 
-        try:
-            db_records = get_history()
-        except Exception as e:
-            st.error(f"Failed to fetch history from database: {e}")
-            db_records = []
+        # Cache history data in session state to prevent reloading and losing selection on rerun
+        if "history_data" not in st.session_state:
+            st.session_state["history_data"] = None
+
+        col_ref, col_space = st.columns([1, 6])
+        with col_ref:
+            if st.button("🔄 Refresh"):
+                st.session_state["history_data"] = None
+                st.rerun()
+
+        if st.session_state["history_data"] is None:
+            try:
+                st.session_state["history_data"] = get_history()
+            except Exception as e:
+                st.error(f"Failed to fetch history from database: {e}")
+                st.session_state["history_data"] = []
+
+        db_records = st.session_state["history_data"]
 
         if not db_records:
             st.info("데이터베이스에 결함 주입 이력이 없습니다. 파이프라인을 먼저 실행해 주세요.")
