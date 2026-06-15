@@ -5,10 +5,14 @@ API_BASE_URL = "http://localhost:8000/api/v1"
 # 네트워크 연결 타임아웃 및 읽기 타임아웃 기본값 (연결 10초, 읽기 30초)
 DEFAULT_REQ_TIMEOUT = (10, 30) 
 
-def _make_request(method, url, **kwargs):
+def _make_request(method, url, api_key=None, **kwargs):
     """모든 HTTP 요청을 처리하는 내부 헬퍼 (에러 메시지 파싱 포함)"""
     if "timeout" not in kwargs:
         kwargs["timeout"] = DEFAULT_REQ_TIMEOUT
+    if api_key:
+        if "headers" not in kwargs:
+            kwargs["headers"] = {}
+        kwargs["headers"]["X-Gemini-API-Key"] = api_key
         
     try:
         response = requests.request(method, url, **kwargs)
@@ -76,11 +80,14 @@ def solve_smt(node_id):
     payload = {"node_id": node_id}
     return _make_request("POST", f"{API_BASE_URL}/smt/solve", json=payload)
 
-def validate_mutant(mutant_id, wait=False):
-    res_json = _make_request("POST", f"{API_BASE_URL}/mutations/{mutant_id}/validate")
+def validate_mutant(mutant_id, api_key=None, wait=False):
+    res_json = _make_request("POST", f"{API_BASE_URL}/mutations/{mutant_id}/validate", api_key=api_key)
     if wait and res_json.get("task_id"):
         return wait_for_task(res_json["task_id"], timeout=120)
     return res_json
+
+def gemini_evaluate_mutant(mutant_id, api_key=None):
+    return _make_request("POST", f"{API_BASE_URL}/mutations/{mutant_id}/gemini-evaluate", api_key=api_key)
 
 def get_target_program(program_id):
     return _make_request("GET", f"{API_BASE_URL}/target/{program_id}")
@@ -131,12 +138,15 @@ def _run_pipeline_tail(prog_id):
     print(f"[{prog_id}] Injecting mutation at node {target_node}...")
     res_mut = inject_mutation(target_node, 1, wait=True)
     
-    # Run SMT solver to get trigger input
-    try:
-        res_smt = solve_smt(target_node)
-        trigger_input = res_smt.get("trigger_input", "")
-    except Exception:
-        trigger_input = ""
+    # Run SMT solver for all corner cases to populate DB
+    trigger_input = ""
+    for cc_node in cc_list:
+        try:
+            res_smt = solve_smt(cc_node["id"])
+            if cc_node["id"] == target_node:
+                trigger_input = res_smt.get("trigger_input", "")
+        except Exception:
+            pass
         
     return {
         "status": "success",

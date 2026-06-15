@@ -6,7 +6,7 @@ import pandas as pd
 from api_client import (
     upload_targets, compile_target, collect_traces, get_corner_cases, inject_mutation, 
     upload_github_target, validate_mutant, get_trace_tree, wait_for_github_import,
-    solve_smt, get_history
+    solve_smt, get_history, gemini_evaluate_mutant
 )
 from components.trace_tree import render_trace_tree_and_table
 from components.diff_viewer import render_diff_viewer, render_rich_diff_viewer
@@ -37,13 +37,16 @@ def _run_pipeline_ui(prog_id: int, status_container, pattern_options, selected_p
         target_node = cc_list[0]["id"]
         res_mut = inject_mutation(target_node, selected_pattern_id, wait=True)
 
-        st.write("Solving path constraints with Z3 SMT Solver...")
-        try:
-            res_smt = solve_smt(target_node)
-            trigger_input = res_smt.get("trigger_input", "")
-        except Exception as e:
-            st.warning(f"SMT Solver failed: {e}")
-            trigger_input = ""
+        st.write("Solving path constraints with Z3 SMT Solver for all corner cases...")
+        trigger_input = ""
+        for cc_node in cc_list:
+            try:
+                res_smt = solve_smt(cc_node["id"])
+                if cc_node["id"] == target_node:
+                    trigger_input = res_smt.get("trigger_input", "")
+            except Exception as e:
+                if cc_node["id"] == target_node:
+                    st.warning(f"SMT Solver failed for target node: {e}")
         
         st.session_state["analysis_result"] = {
             "status": "success",
@@ -145,10 +148,28 @@ def create_pdf_report(record):
 
     # --- [섹션 3: 기술 상세 정보 (Z3 & Diff)] ---
     pdf.set_font("D2Coding", size=13)
-    pdf.cell(0, 10, "🎯 Z3 SMT Solver Trigger Condition", ln=True)
-    pdf.set_font("D2Coding", size=10)
-    pdf.multi_cell(0, 6, z3_cond)
-    pdf.ln(5)
+    pdf.cell(0, 10, "🎯 Z3 SMT Solver Trigger Conditions & Inputs", ln=True)
+    
+    constraints_list = record.get('constraints', [])
+    if constraints_list:
+        for c_item in constraints_list:
+            loc_str = c_item.get('code_location', 'Unknown')
+            expr_str = c_item.get('constraint_expr', 'N/A')
+            inp_str = c_item.get('trigger_input', 'N/A')
+            
+            pdf.set_font("D2CodingBold", size=10)
+            pdf.cell(0, 6, f" Location: {loc_str}", ln=True)
+            pdf.set_font("D2Coding", size=9)
+            pdf.multi_cell(0, 5, f"Constraint: {expr_str}")
+            pdf.ln(2)
+            pdf.multi_cell(0, 5, f"Trigger Input: {inp_str}")
+            pdf.ln(4)
+    else:
+        pdf.set_font("D2Coding", size=10)
+        pdf.multi_cell(0, 6, f"Constraint: {z3_cond}")
+        pdf.ln(2)
+        pdf.multi_cell(0, 6, f"Trigger Input: {record.get('trigger_input', 'N/A')}")
+        pdf.ln(4)
     
     pdf.line(10, pdf.get_y(), 200, pdf.get_y())
     pdf.ln(5)
@@ -165,19 +186,67 @@ def create_pdf_report(record):
     hunk_patterns = {}
     current_hunk_line = None
     
+    # 1. Gather code lines per hunk
+    hunk_lines = {}
     for line in diff.splitlines():
         hunk_match = re.search(r'@@ -(\d+)', line)
         if hunk_match:
             current_hunk_line = hunk_match.group(1)
-            # 단일 값이 아닌 Set()으로 초기화하여 여러 개를 담을 준비를 합니다.
-            if current_hunk_line not in hunk_patterns:
-                hunk_patterns[current_hunk_line] = set()
+            hunk_lines[current_hunk_line] = []
+        elif current_hunk_line:
+            hunk_lines[current_hunk_line].append(line)
             
-        elif current_hunk_line and line.startswith('+'):
-            cwe_match = re.search(r'Injected\s+(CWE-\d+)', line)
-            if cwe_match:
-                # 💡 해당 구간의 Set 바구니에 발견된 패턴을 계속 추가(add)합니다.
-                hunk_patterns[current_hunk_line].add(cwe_match.group(1))
+    # 2. Analyze hunk lines dynamically to resolve specific CWEs
+    db_pattern = record.get('pattern', 'Unknown Pattern')
+    cwe_candidates = re.findall(r'(CWE-\d+)', db_pattern)
+    
+    for h_line, lines in hunk_lines.items():
+        hunk_patterns[h_line] = set()
+        detected = set()
+        
+        added_lines = [l[1:] for l in lines if l.startswith('+')]
+        deleted_lines = [l[1:] for l in lines if l.startswith('-')]
+        added_text = "\n".join(added_lines)
+        deleted_text = "\n".join(deleted_lines)
+        
+        # CWE-193 Boundary Condition Error
+        if ('<' in deleted_text and '<=' in added_text) or ('<=' in deleted_text and '<' in added_text):
+            detected.add('CWE-193')
+            
+        # CWE-190 Integer Overflow
+        if any(('+ 1' in add_line or ' + 1' in add_line) for add_line in added_lines):
+            detected.add('CWE-190')
+            
+        # CWE-476 NULL Pointer Dereference
+        if 'nullptr' in added_text:
+            detected.add('CWE-476')
+            
+        # CWE-390 Detection of Error Condition Without Action
+        if any(add_line.strip() == '{}' for add_line in added_lines) or '{}' in added_text:
+            if len(deleted_lines) > 0 and not any(del_line.strip() == '{}' for del_line in deleted_lines):
+                detected.add('CWE-390')
+                
+        # CWE-401 Memory Leak
+        if any(add_line.strip() == ';' for add_line in added_lines) or ';' in added_text:
+            if any(('delete' in del_line or 'free' in del_line) for del_line in deleted_lines):
+                detected.add('CWE-401')
+                
+        # CWE-682 Incorrect Calculation
+        operators = ['&&', '||', '&', '|', '%', '/', '*']
+        for op1 in operators:
+            for op2 in operators:
+                if op1 != op2:
+                    if any(op1 in del_line for del_line in deleted_lines) and any(op2 in add_line for add_line in added_lines):
+                        detected.add('CWE-682')
+                        
+        valid_detected = {c for c in detected if c in cwe_candidates}
+        if valid_detected:
+            hunk_patterns[h_line] = valid_detected
+        else:
+            if cwe_candidates:
+                hunk_patterns[h_line].add(cwe_candidates[0])
+            else:
+                hunk_patterns[h_line].add(db_pattern)
 
     for line in diff.splitlines():
         clean_line = line.replace('\xa0', ' ').replace('\t', '    ')
@@ -200,61 +269,13 @@ def create_pdf_report(record):
             match = re.search(r'@@ -(\d+)', clean_line)
             if match:
                 line_num = match.group(1)
-                local_patterns_set = hunk_patterns.get(line_num, set())
-                
-                cwe_list = sorted(local_patterns_set) if local_patterns_set else []
-                if not cwe_list:
-                    db_pattern = record.get('pattern', 'Unknown Pattern')
-                    db_cwe_match = re.search(r'(CWE-\d+)', db_pattern)
-                    cwe_str = db_cwe_match.group(1) if db_cwe_match else db_pattern
-                    cwe_list = [cwe_str]
-
-                # 💡 1. 텍스트를 조각(Chunk) 단위로 쪼개서 리스트에 담습니다. (HTML 사용 안 함!)
-                chunks = [{"text": f"[ 코드 변경 구간 : Line {line_num} 부근  |  ", "url": ""}]
-                
-                for i, cwe in enumerate(cwe_list):
-                    cwe_num_match = re.search(r'CWE-(\d+)', cwe)
-                    url = f"https://cwe.mitre.org/data/definitions/{cwe_num_match.group(1)}.html" if cwe_num_match else ""
-                    
-                    # 결함 번호 조각 (링크 있음)
-                    chunks.append({"text": cwe, "url": url})
-                    
-                    # 쉼표 조각 (링크 없음)
-                    if i < len(cwe_list) - 1:
-                        chunks.append({"text": ", ", "url": ""})
-                        
-                # 닫는 괄호 조각 (링크 없음)
-                chunks.append({"text": " ]", "url": ""})
-                
-                # 💡 2. 전체 텍스트 길이를 계산하여 완벽한 중앙 X 좌표 도출
-                pdf.set_font("D2CodingBold", size=9)
-                total_width = sum(pdf.get_string_width(chunk["text"]) for chunk in chunks)
-                current_x = 10 + (pdf.epw - total_width) / 2
-                
-                # 💡 3. 캔버스 위에 연보라색 배경 박스를 직접 그립니다.
-                start_y = pdf.get_y()
+                hunk_banner = f"[ 코드 변경 구간 : Line {line_num} 부근 ]"
+                pdf.set_x(10)
                 pdf.set_fill_color(243, 235, 250)
-                pdf.rect(10, start_y, pdf.epw, 6, style='F')
-                
-                # 💡 4. 조각들을 중앙 좌표부터 가로로 쭉 이어 붙입니다.
-                pdf.set_y(start_y + 1) # 세로 중앙 정렬 미세조정
-                pdf.set_text_color(111, 66, 193) # 전체 텍스트 보라색 고정
-                
-                for chunk in chunks:
-                    pdf.set_x(current_x)
-                    chunk_width = pdf.get_string_width(chunk["text"])
-                    
-                    # cell 함수에 link 파라미터를 주면 밑줄 없이 투명한 클릭 영역만 생성됩니다!
-                    if chunk["url"]:
-                        pdf.cell(chunk_width, 4, chunk["text"], link=chunk["url"])
-                    else:
-                        pdf.cell(chunk_width, 4, chunk["text"])
-                        
-                    current_x += chunk_width # 다음 조각을 위해 X 좌표를 글자 폭만큼 이동
-                    
-                # 5. 다음 코드 출력을 위해 Y 좌표를 배너 아래로 내립니다.
-                pdf.set_y(start_y + 8)
-                
+                pdf.set_text_color(111, 66, 193)
+                pdf.set_font("D2CodingBold", size=9)
+                pdf.cell(pdf.epw, 6, hunk_banner, ln=True, fill=True, align='C')
+                pdf.ln(3)
             else:
                 hunk_banner = f"[ {clean_line} ]"
                 pdf.set_x(10)
@@ -300,12 +321,17 @@ def main() -> None:
             0: "Auto Detect (Find any applicable pattern)",
             1: "CWE-190 Integer Overflow",
             2: "CWE-193 Boundary Condition Error",
-            3: "CWE-476 NULL Pointer Dereference",
-            4: "CWE-122 Heap Buffer Overflow",
-            5: "CWE-416 Use After Free",
-            6: "CWE-401 Memory Leak"
+            3: "CWE-390 Detection of Error Condition Without Action",
+            4: "CWE-401 Memory Leak",
+            5: "CWE-476 NULL Pointer Dereference",
+            6: "CWE-682 Incorrect Calculation"
         }
-        selected_pattern_id = 0
+        selected_pattern_id = st.selectbox(
+            "Select Vulnerability Pattern to Inject",
+            options=list(pattern_options.keys()),
+            format_func=lambda x: pattern_options[x],
+            index=0
+        )
         
         # 상태 초기화
         if "analysis_result" not in st.session_state:
@@ -393,7 +419,10 @@ def main() -> None:
                         val_res = st.session_state["validation_results"][m_id]
                         st.success(f"Validation Complete! Survival Rate: **{val_res.get('survival_rate', 0):.1f}%**")
                         if val_res.get("llm_score"):
-                            st.write(f"LLM Score: {val_res.get('llm_score')}")
+                            st.success(f"**Gemini AI Score:** {val_res.get('llm_score')}")
+                            if val_res.get("llm_rationale") or val_res.get("llm_reasoning"):
+                                rationale_text = val_res.get("llm_rationale") or val_res.get("llm_reasoning")
+                                st.info(f"**AI Rationale:** {rationale_text}")
                     else:
                         if st.button(f"Validate Mutant {m_id}", key=f"val_{idx}"):
                             with st.spinner("Running validation pipeline in Docker..."):
@@ -411,7 +440,29 @@ def main() -> None:
             with col_afl:
                 st.button("Trigger AFL++ Fuzzer (Manual)", help="Manual re-run of AFL++")
             with col_gemini:
-                st.button("Trigger Gemini API Verification (Manual)", help="Run LLM analysis on mutants")
+                if st.button("Trigger Gemini API Verification (Manual)", help="Run LLM analysis on mutants"):
+                    if not mutations:
+                        st.warning("평가할 뮤턴트가 없습니다. 파이프라인을 먼저 실행하십시오.")
+                    else:
+                        with st.spinner("Gemini 정성 평가 수행 중..."):
+                            success_count = 0
+                            for val_idx, mut_item in enumerate(mutations):
+                                current_m_id = mut_item.get('mutant_id')
+                                if current_m_id:
+                                    try:
+                                        res = gemini_evaluate_mutant(current_m_id)
+                                        if current_m_id not in st.session_state["validation_results"]:
+                                            st.session_state["validation_results"][current_m_id] = {}
+                                        score = res.get("llm_score")
+                                        rationale = res.get("llm_rationale")
+                                        st.session_state["validation_results"][current_m_id]["llm_score"] = f"{int(score)}/10" if score is not None else "N/A"
+                                        st.session_state["validation_results"][current_m_id]["llm_rationale"] = rationale
+                                        success_count += 1
+                                    except Exception as e:
+                                        st.error(f"Mutant {current_m_id} Gemini 평가 중 오류 발생: {e}")
+                            if success_count > 0:
+                                st.success(f"{success_count}개 뮤턴트에 대한 Gemini 정성 평가를 완료했습니다!")
+                                st.rerun()
 
     with tab_history:
         st.markdown("### 📚 Injection History Dashboard")
@@ -489,10 +540,34 @@ def main() -> None:
                     st.warning(f"**Survival Rate:** {selected_record.get('survival_rate', 0.0):.1f}%")
                 with col3:
                     st.caption("🤖 **Gemini AI Score**")
-                    st.success(f"**Gemini AI Score:** {selected_record.get('llm_score', 'N/A')}")
+                    llm_score_val = selected_record.get('llm_score', 'N/A')
+                    st.success(f"**Gemini AI Score:** {llm_score_val}")
+                    
+                    if st.button("Trigger Gemini API", key=f"gemini_eval_hist_{selected_record.get('id')}"):
+                        with st.spinner("Gemini 정성 평가 수행 중..."):
+                            try:
+                                res = gemini_evaluate_mutant(selected_record.get('id'))
+                                st.success(f"평가 완료! 점수: {res.get('llm_score')}/10")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Gemini 평가 실패: {e}")
 
-                st.markdown("##### 🎯 Z3 SMT Solver Trigger Condition")
-                st.code(selected_record.get('z3_condition', '조건 정보 없음'), language="lisp")
+                llm_reasoning_val = selected_record.get('llm_reasoning', '평가 대기 중 또는 점수 없음')
+                if llm_reasoning_val and llm_reasoning_val != '평가 대기 중 또는 점수 없음':
+                    st.info(f"**🤖 Gemini AI Rationale:** {llm_reasoning_val}")
+
+                st.markdown("##### 🎯 Z3 SMT Solver Trigger Conditions & Inputs")
+                constraints = selected_record.get('constraints', [])
+                if constraints:
+                    for idx, c_item in enumerate(constraints):
+                        with st.expander(f"📍 Location: `{c_item.get('code_location', 'Unknown')}`", expanded=True):
+                            st.caption("**Z3 Path Condition**")
+                            st.code(c_item.get('constraint_expr', 'N/A'), language="lisp")
+                            st.caption("**Trigger Input (PoC)**")
+                            st.code(c_item.get('trigger_input', 'N/A'), language="plaintext")
+                else:
+                    st.code(selected_record.get('z3_condition', '조건 정보 없음'), language="lisp")
+                    st.code(selected_record.get('trigger_input', 'N/A'), language="plaintext")
 
                 st.markdown("##### 💻 Code Diff (Side-by-Side)")
                 

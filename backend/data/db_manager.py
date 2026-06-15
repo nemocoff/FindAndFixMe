@@ -320,3 +320,16 @@ class TraceDBManager:
             """
             rows = conn.execute(query).fetchall()
             return [dict(row) for row in rows]
+
+    def get_program_constraints(self, program_id: int) -> List[Dict[str, Any]]:
+        """특정 프로그램에 매핑된 모든 코너 케이스 노드의 SMT 제약 조건과 트리거 입력을 조회"""
+        with get_db_connection(self.db_path) as conn:
+            query = """
+                SELECT c.code_location, s.constraint_expr, s.trigger_input
+                FROM CornerCaseNode c
+                JOIN SMTConstraint s ON c.id = s.node_id
+                JOIN DynamicTrace t ON c.trace_id = t.id
+                WHERE t.program_id = ? AND s.is_solved = 1
+            """
+            rows = conn.execute(query, (program_id,)).fetchall()
+            return [dict(row) for row in rows]

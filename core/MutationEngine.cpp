@@ -93,6 +93,12 @@ public:
 
     void setContext(ASTContext* C) { Context = C; }
 
+    std::string getExprString(const Expr* E) {
+        if (!E || !Context) return "";
+        SourceRange sr = E->getSourceRange();
+        return Lexer::getSourceText(CharSourceRange::getTokenRange(sr), Context->getSourceManager(), Context->getLangOpts()).str();
+    }
+
     void run(const MatchFinder::MatchResult& Result) override {
         // [New] Check TargetFunc filter
         if (!TargetFunc.empty()) {
@@ -110,10 +116,19 @@ public:
             if (const BinaryOperator* BinOp =
                     Result.Nodes.getNodeAs<clang::BinaryOperator>("cwe190")) {
                 if (BinOp->getOpcode() == BO_Add) {
-                    Rewrite.ReplaceText(
-                        BinOp->getSourceRange(),
-                        "2147483647 + 1 /* Injected CWE-190: Integer Overflow */"
-                    );
+                    std::string lhs = getExprString(BinOp->getLHS());
+                    std::string rhs = getExprString(BinOp->getRHS());
+                    if (!lhs.empty() && !rhs.empty()) {
+                        Rewrite.ReplaceText(
+                            BinOp->getSourceRange(),
+                            lhs + " + " + rhs + " + 1"
+                        );
+                    } else {
+                        Rewrite.ReplaceText(
+                            BinOp->getSourceRange(),
+                            "1"
+                        );
+                    }
                     mutations_log.push_back({1, "CWE-190 Integer Overflow", "injected"});
                 }
             }
@@ -124,10 +139,10 @@ public:
             if (const BinaryOperator* BinOp =
                     Result.Nodes.getNodeAs<clang::BinaryOperator>("cwe193")) {
                 if (BinOp->getOpcode() == BO_LT) {
-                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 1, "<= /* Injected CWE-193: Loop Boundary Condition Inverse */");
+                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 1, "<=");
                     mutations_log.push_back({2, "CWE-193 Boundary Condition Error", "injected"});
                 } else if (BinOp->getOpcode() == BO_LE) {
-                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 2, "< /* Injected CWE-193: Loop Boundary Condition Inverse */");
+                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 2, "<");
                     mutations_log.push_back({2, "CWE-193 Boundary Condition Error", "injected"});
                 }
             }
@@ -137,13 +152,13 @@ public:
         if (targetPatternId == 0 || targetPatternId == 3) {
             if (const CXXCatchStmt* Catch = Result.Nodes.getNodeAs<CXXCatchStmt>("cwe390_catch")) {
                 if (const Stmt* Block = Catch->getHandlerBlock()) {
-                    Rewrite.ReplaceText(Block->getSourceRange(), "{ /* Exception ignored - Injected CWE-390 */ }");
+                    Rewrite.ReplaceText(Block->getSourceRange(), "{}");
                     mutations_log.push_back({3, "CWE-390 Detection of Error Condition Without Action", "injected"});
                 }
             }
             else if (const IfStmt* If = Result.Nodes.getNodeAs<IfStmt>("cwe390_if")) {
                 if (const Stmt* Then = If->getThen()) {
-                    Rewrite.ReplaceText(Then->getSourceRange(), "{ /* Error handling ignored - Injected CWE-390 */ }");
+                    Rewrite.ReplaceText(Then->getSourceRange(), "{}");
                     mutations_log.push_back({3, "CWE-390 Detection of Error Condition Without Action", "injected"});
                 }
             }
@@ -152,11 +167,11 @@ public:
         // ── CWE-401: 메모리 누수 ───────────────────────────
         if (targetPatternId == 0 || targetPatternId == 4) {
             if (const CXXDeleteExpr* DelExpr = Result.Nodes.getNodeAs<CXXDeleteExpr>("cwe401_delete")) {
-                Rewrite.ReplaceText(DelExpr->getSourceRange(), "/* delete removed - Injected CWE-401 */");
+                Rewrite.ReplaceText(DelExpr->getSourceRange(), ";");
                 mutations_log.push_back({4, "CWE-401 Memory Leak", "injected"});
             }
             else if (const CallExpr* FreeCall = Result.Nodes.getNodeAs<CallExpr>("cwe401_free")) {
-                Rewrite.ReplaceText(FreeCall->getSourceRange(), "/* free removed - Injected CWE-401 */");
+                Rewrite.ReplaceText(FreeCall->getSourceRange(), ";");
                 mutations_log.push_back({4, "CWE-401 Memory Leak", "injected"});
             }
         }
@@ -172,7 +187,7 @@ public:
                 SourceLocation insertLoc = DS->getEndLoc().getLocWithOffset(1);
                 Rewrite.InsertTextAfter(
                     insertLoc,
-                    "\n*((int*)nullptr) = 0; /* Injected CWE-476: NULL Pointer Dereference */"
+                    "\n*((int*)nullptr) = 0;"
                 );
                 mutations_log.push_back({5, "CWE-476 NULL Pointer Dereference", "injected"});
             }
@@ -192,7 +207,7 @@ public:
                 else if (BinOp->getOpcode() == BO_Mul) { rep = "+"; }
                 
                 if (!rep.empty()) {
-                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), opLen, rep + " /* Injected CWE-682 */");
+                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), opLen, rep);
                     mutations_log.push_back({6, "CWE-682 Incorrect Calculation", "injected"});
                 }
             }
@@ -220,6 +235,8 @@ public:
             Finder.addMatcher(
                 binaryOperator(isExpansionInMainFile(),
                                hasOperatorName("+"),
+                               unless(hasLHS(binaryOperator(hasOperatorName("+")))),
+                               unless(hasRHS(binaryOperator(hasOperatorName("+")))),
                                hasAncestor(functionDecl().bind("parent_func"))).bind("cwe190"),
                 &Callback);
         }

@@ -21,7 +21,7 @@ import hashlib
 from datetime import datetime
 from typing import Optional, Dict
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, Header
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -35,6 +35,7 @@ from .data.smt_solver import SMTSolver
 app = FastAPI(title="FindAndFixMe API Orchestrator (Dockerized)")
 
 TASK_STATUS: Dict[str, dict] = {} # 비동기 작업 상태 저장소
+GEMINI_API_KEY_DEFAULT = ""  # <-- 여기에 Gemini API 키를 입력하여 테스트할 수 있습니다.
 GITHUB_URL_PATTERN = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?$")
 
 db = TraceDBManager(DB_PATH)
@@ -1028,7 +1029,71 @@ def _perform_injection(req: MutationInjectRequest):
     }
 
 
-def _validation_task(task_id: int, mutant_id: int):
+def _run_gemini_evaluation(mutant: dict, api_key: str):
+    import google.generativeai as genai
+    import json
+    import re
+
+    genai.configure(api_key=api_key)
+    model_name = "gemini-2.5-flash-lite"
+    try:
+        model = genai.GenerativeModel(model_name)
+    except Exception:
+        model_name = "gemini-2.5-flash-lite"
+        model = genai.GenerativeModel(model_name)
+        
+    prompt = f"""
+You are an expert C/C++ security researcher and code quality analyst.
+We have injected a mutant (vulnerability/fault) into the following C/C++ program.
+We need you to evaluate the "naturalness" and "quality" of the mutated code.
+A "natural" mutant is one that looks like a realistic, human-written bug, is syntactically and semantically plausible, and fits smoothly into the surrounding code context.
+
+[Original Code]
+{mutant.get('original_code', 'N/A')}
+
+[Mutated Code]
+{mutant.get('mutated_code', 'N/A')}
+
+Please evaluate the mutated code on a scale of 1 to 10:
+- 10: Extremely natural, looks exactly like a real bug a human developer would write, very hard to distinguish from the surrounding style.
+- 1: Looks completely artificial, syntactically broken, or nonsensical.
+
+Respond ONLY with a JSON object in the following format (do not include markdown block markers like ```json):
+{{
+  "score": <integer from 1 to 10>,
+  "rationale": "<detailed explanation in Korean about why this score was given, and how realistic the bug is>"
+}}
+"""
+    
+    response = model.generate_content(prompt)
+    text = response.text.strip()
+    
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+    
+    try:
+        data = json.loads(text)
+        score = float(data.get("score", 5))
+        rationale = data.get("rationale", "평가 성공")
+        return score, rationale
+    except Exception as e:
+        score_match = re.search(r'"score"\s*:\s*(\d+)', text)
+        rationale_match = re.search(r'"rationale"\s*:\s*"([^"]+)"', text)
+        
+        score = float(score_match.group(1)) if score_match else 5.0
+        if rationale_match:
+            rationale = rationale_match.group(1)
+        else:
+            rationale = text.replace('\n', ' ')[:500]
+        return score, rationale
+
+
+def _validation_task(task_id: int, mutant_id: int, api_key: Optional[str] = None):
     try:
         mutant = db.get_mutant(mutant_id)
         program = db.get_program(mutant["program_id"]) if mutant else None
@@ -1085,31 +1150,63 @@ def _validation_task(task_id: int, mutant_id: int):
         survival_rate = ((total_runs - killed_count) / total_runs * 100.0) if total_runs > 0 else (90.0 if os.path.exists(afl_out_dir) else 0.0)
 
         # ── LLM 평가 (생존율 ≥ 95% 시) ───────────────────────────────
+        # [수정] 자동 정성 평가는 수행하지 않고 수동 정성 평가만 지원
         llm_score = None
         llm_rationale = None
 
-        if survival_rate >= 95.0:
-            # TODO: Gemini API 연동 (사용자 선택 시 활성화)
-            # import google.generativeai as genai
-            # model = genai.GenerativeModel("gemini-pro")
-            # resp = model.generate_content(f"코드 자연스러움 평가:\n{mutant['mutated_code']}")
-            llm_score = None      # 실제 연동 전까지 None 유지
-            llm_rationale = None
-
         db.update_mutant_validation(mutant_id, survival_rate, llm_score, llm_rationale, total_runs)
-        TASK_STATUS[task_id] = {"status": "completed", "result": {"survival_rate": survival_rate, "llm_score": llm_score}}
+        TASK_STATUS[task_id] = {
+            "status": "completed", 
+            "result": {
+                "survival_rate": survival_rate, 
+                "llm_score": f"{int(llm_score)}/10" if llm_score is not None else "N/A",
+                "llm_reasoning": llm_rationale or "평가 대기 중 또는 점수 없음"
+            }
+        }
         print(f"[Validation Docker] mutant_id={mutant_id} survival_rate={survival_rate:.1f}%")
     except Exception as e:
         TASK_STATUS[task_id] = {"status": "failed", "error": str(e)}
 
 
 @app.post("/api/v1/mutations/{mutant_id}/validate")
-async def validate_mutant(mutant_id: int, background_tasks: BackgroundTasks):
+async def validate_mutant(
+    mutant_id: int, 
+    background_tasks: BackgroundTasks,
+    x_gemini_api_key: Optional[str] = Header(None)
+):
     if not db.get_mutant(mutant_id): raise HTTPException(status_code=404, detail="Mutant not found.")
     task_id = f"validate_{mutant_id}_{int(time.time())}"
     TASK_STATUS[task_id] = {"status": "processing"}
-    background_tasks.add_task(_validation_task, task_id, mutant_id)
+    background_tasks.add_task(_validation_task, task_id, mutant_id, x_gemini_api_key)
     return {"status": "accepted", "task_id": task_id}
+
+
+@app.post("/api/v1/mutations/{mutant_id}/gemini-evaluate")
+async def gemini_evaluate_mutant(
+    mutant_id: int,
+    x_gemini_api_key: Optional[str] = Header(None)
+):
+    """[US-xx] Run Gemini evaluation for a specific mutant manually"""
+    mutant = db.get_mutant(mutant_id)
+    if not mutant:
+        raise HTTPException(status_code=404, detail="Mutant not found.")
+    
+    key = x_gemini_api_key or os.environ.get("GEMINI_API_KEY") or GEMINI_API_KEY_DEFAULT
+    if not key:
+        raise HTTPException(status_code=400, detail="Gemini API Key is missing. Please set GEMINI_API_KEY_DEFAULT in backend/api.py or set environment variable.")
+    
+    try:
+        llm_score, llm_rationale = _run_gemini_evaluation(mutant, key)
+        db.update_mutant_validation(
+            mutant_id, 
+            survival_rate=mutant.get("survival_rate", 0.0), 
+            llm_score=llm_score, 
+            llm_rationale=llm_rationale,
+            total_execs=mutant.get("total_execs", 0)
+        )
+        return {"status": "success", "llm_score": llm_score, "llm_rationale": llm_rationale}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gemini API Error: {str(e)}")
 
 
 @app.get("/api/v1/mutations/{mutant_id}/report")
@@ -1138,6 +1235,9 @@ async def get_mutations_history():
         ))
         diff_str = "".join(diff_lines)
         
+        # 이 프로그램에 등록된 모든 코너 케이스의 SMT 제약 조건 및 트리거 입력 조회
+        constraints = db.get_program_constraints(rec.get("program_id"))
+        
         # 이력 리스트 렌더링에 적합하도록 필드 정규화
         result.append({
             "id": rec.get("mutant_id"),
@@ -1151,6 +1251,8 @@ async def get_mutations_history():
             "llm_reasoning": rec.get("llm_rationale") or "평가 대기 중 또는 점수 없음",
             "retry_count": 0,
             "z3_condition": rec.get("constraint_expr") or "N/A",
+            "trigger_input": rec.get("trigger_input") or "N/A",
+            "constraints": constraints,
             "diff": diff_str
         })
     return result
