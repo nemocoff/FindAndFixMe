@@ -62,6 +62,9 @@ static const std::map<int, std::string> PATTERN_REGISTRY = {
     {4, "CWE-401 Memory Leak"},
     {5, "CWE-476 NULL Pointer Dereference"},
     {6, "CWE-682 Incorrect Calculation"},
+    {7, "CWE-416 Use After Free (UAF)"},
+    {8, "CWE-125/787 Out-of-bounds Access"},
+    {9, "CWE-362 Race Condition"},
 };
 
 // JSON 이스케이프 헬퍼
@@ -111,25 +114,29 @@ public:
             }
         }
 
-        // ── [T10] CWE-190: 정수 덧셈 오버플로우 주입 ──────────────────────
+        // ── [T10] CWE-190: 정수 오버플로우 (타입 캐스팅 축소) 주입 ──────────────────────
         if (targetPatternId == 0 || targetPatternId == 1) {
+            // 위 Step 1에서 수정한 바인딩 이름("cwe190_mul")으로 노드를 가져옵니다.
             if (const BinaryOperator* BinOp =
                     Result.Nodes.getNodeAs<clang::BinaryOperator>("cwe190")) {
-                if (BinOp->getOpcode() == BO_Add) {
+                
+                // 연산자가 곱셈(BO_Mul)인지 확인
+                if (BinOp->getOpcode() == BO_Mul) {
                     std::string lhs = getExprString(BinOp->getLHS());
                     std::string rhs = getExprString(BinOp->getRHS());
+                    
                     if (!lhs.empty() && !rhs.empty()) {
+                        // 기존의 "A * B" 연산 전체를 "(short)(A * B)" 형태로 강제 캐스팅
+                        // 메모리 할당 크기 등을 계산할 때 값이 잘려나가 음수가 되거나 작아지게 만듦
+                        std::string mutatedExpr = "(short)(" + lhs + " * " + rhs + ")";
+                        
                         Rewrite.ReplaceText(
                             BinOp->getSourceRange(),
-                            lhs + " + " + rhs + " + 1"
+                            mutatedExpr
                         );
-                    } else {
-                        Rewrite.ReplaceText(
-                            BinOp->getSourceRange(),
-                            "1"
-                        );
+                        
+                        mutations_log.push_back({1, "CWE-190 Integer Overflow (Truncation)", "injected"});
                     }
-                    mutations_log.push_back({1, "CWE-190 Integer Overflow", "injected"});
                 }
             }
         }
@@ -167,10 +174,16 @@ public:
         // ── CWE-401: 메모리 누수 ───────────────────────────
         if (targetPatternId == 0 || targetPatternId == 4) {
             if (const CXXDeleteExpr* DelExpr = Result.Nodes.getNodeAs<CXXDeleteExpr>("cwe401_delete")) {
+                // 포인터 변수명 추출 및 블랙리스트 등록
+                std::string ptrName = getExprString(DelExpr->getArgument());
+                corrupted_pointers.insert(ptrName);
                 Rewrite.ReplaceText(DelExpr->getSourceRange(), ";");
                 mutations_log.push_back({4, "CWE-401 Memory Leak", "injected"});
             }
             else if (const CallExpr* FreeCall = Result.Nodes.getNodeAs<CallExpr>("cwe401_free")) {
+                // 포인터 변수명 추출 및 블랙리스트 등록
+                std::string ptrName = getExprString(DelExpr->getArgument());
+                corrupted_pointers.insert(ptrName);
                 Rewrite.ReplaceText(FreeCall->getSourceRange(), ";");
                 mutations_log.push_back({4, "CWE-401 Memory Leak", "injected"});
             }
@@ -212,6 +225,56 @@ public:
                 }
             }
         }
+
+        // ── [자연스러운 버전] CWE-416: Use After Free (Dangling Pointer 유발) ──────────
+        // (참고: 탐색 조건에서 'ptr = nullptr;' 같은 할당문(BinaryOperator)을 찾았다고 가정)
+        if (targetPatternId == 0 || targetPatternId == 7) {
+            if (const BinaryOperator* NullAssign = Result.Nodes.getNodeAs<BinaryOperator>("cwe416_null_assign")) {
+                // 이미 누수(401) 처리된 포인터인지 확인하여 마스킹 방지
+                std::string ptrName = getExprString(NullAssign->getLHS());
+                if (corrupted_pointers.find(ptrName) != corrupted_pointers.end()) {
+                    return; // 이미 오염된 포인터면 주입 생략
+                }
+
+                Rewrite.ReplaceText(NullAssign->getSourceRange(), "/* Forgot to nullify pointer */");
+                mutations_log.push_back({7, "CWE-416 Use After Free (Missing Null Assignment)", "injected"});
+            }
+        }
+
+        // ── [수정] CWE-125/787: OOB (할당 크기 축소) 주입 ───────────────────
+        if (targetPatternId == 0 || targetPatternId == 8) {
+            if (const CXXNewExpr* NewExpr = Result.Nodes.getNodeAs<CXXNewExpr>("cwe_oob_alloc")) {
+                
+                // Clang AST에서 배열의 크기 지정 수식(예: len, size, 10 등)을 가져옴
+                if (const Expr* ArraySizeExpr = NewExpr->getArraySize().value_or(nullptr)) {
+                    std::string sizeStr = getExprString(ArraySizeExpr);
+                    
+                    if (!sizeStr.empty()) {
+                        // 원래 크기에서 1을 빼서 버퍼를 작게 만듦 (예: new int[len] -> new int[(len) - 1])
+                        std::string mutatedSize = "(" + sizeStr + ") - 1";
+                        
+                        Rewrite.ReplaceText(ArraySizeExpr->getSourceRange(), mutatedSize);
+                        
+                        mutations_log.push_back({8, "CWE-125/787 OOB (Buffer Under-allocation)", "injected"});
+                    }
+                }
+            }
+        }
+
+        // ── [교묘한 버전] CWE-362: Race Condition (임시 객체 실수) ──────────────
+        if (targetPatternId == 0 || targetPatternId == 9) {
+            if (const VarDecl* LockVar = Result.Nodes.getNodeAs<VarDecl>("cwe362_lock")) {
+                // 선언된 락 변수의 이름(예: lock, guard 등)을 찾아 빈 문자열로 지워버림
+                std::string varName = LockVar->getNameAsString();
+                if (!varName.empty()) {
+                    SourceLocation nameLoc = LockVar->getLocation();
+                    // 변수명 길이만큼의 텍스트를 삭제하여 이름 없는 임시 객체로 만듦
+                    Rewrite.RemoveText(nameLoc, varName.length());
+                    
+                    mutations_log.push_back({9, "CWE-362 Race Condition (Temporary Lock Object)", "injected"});
+                }
+            }
+        }
     }
 
 private:
@@ -219,6 +282,9 @@ private:
     std::vector<MutationResult>& mutations_log;
     ASTContext* Context = nullptr;
     int targetPatternId;
+
+    // 💡 마스킹 방지를 위한 블랙리스트 추가
+    std::set<std::string> corrupted_pointers;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,10 +300,9 @@ public:
         if (all || patternId == 1) {
             Finder.addMatcher(
                 binaryOperator(isExpansionInMainFile(),
-                               hasOperatorName("+"),
-                               unless(hasLHS(binaryOperator(hasOperatorName("+")))),
-                               unless(hasRHS(binaryOperator(hasOperatorName("+")))),
-                               hasAncestor(functionDecl().bind("parent_func"))).bind("cwe190"),
+                               hasOperatorName("*"),
+                               hasAncestor(declStmt()), // 💡 선언문 내부의 곱셈만 타겟팅 (추가)
+                               hasAncestor(functionDecl().bind("parent_func"))).bind("cwe190"), // 바인딩 이름 수정 반영
                 &Callback);
         }
 
@@ -299,11 +364,42 @@ public:
                 binaryOperator(isExpansionInMainFile(),
                                anyOf(hasOperatorName("&&"), hasOperatorName("||"),
                                      hasOperatorName("&"), hasOperatorName("|"),
-                                     hasOperatorName("%"), hasOperatorName("/"),
-                                     hasOperatorName("*")),
+                                     hasOperatorName("%"), hasOperatorName("/")), 
+                                     // 💡 곱셈(*) 제외 및 논리/비트 연산 위주로 구성
+                               hasAncestor(ifStmt()), // 💡 조건문 내부로 타겟 한정 (추가)
                                hasAncestor(functionDecl().bind("parent_func"))).bind("cwe682"),
                 &Callback);
         }
+
+        // ── [추가] CWE-416: Use After Free 탐색 (nullptr 할당문 찾기) ────────────────────────
+        if (all || patternId == 7) {
+            Finder.addMatcher(
+                binaryOperator(isExpansionInMainFile(),
+                               hasOperatorName("="),
+                               hasRHS(cxxNullPtrLiteralExpr()), // 우항이 nullptr인 경우
+                               hasAncestor(functionDecl().bind("parent_func"))).bind("cwe416_null_assign"),
+                &Callback);
+        }
+
+        // ── [수정] CWE-125/787: OOB (할당 크기 축소) 탐색 ──────────────────
+        if (all || patternId == 8) {
+            // C++의 'new Type[size]' 형태의 배열 동적 할당 구문을 찾음
+            Finder.addMatcher(
+                cxxNewExpr(isExpansionInMainFile(),
+                           isArray(), // 단일 객체가 아닌 배열 할당인지 확인
+                           hasAncestor(functionDecl().bind("parent_func"))).bind("cwe_oob_alloc"),
+                &Callback);
+        }
+
+        // ── [추가] CWE-362: Race Condition 탐색 (Lock 제거) ──────────────
+        if (all || patternId == 9) {
+            Finder.addMatcher(
+                varDecl(isExpansionInMainFile(),
+                        hasType(recordDecl(hasName("std::lock_guard"))),
+                        hasAncestor(functionDecl().bind("parent_func"))).bind("cwe362_lock"),
+                &Callback);
+        }
+        
     }
 
     void HandleTranslationUnit(ASTContext& Context) override {

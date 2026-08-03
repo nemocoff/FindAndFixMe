@@ -411,58 +411,81 @@ def main() -> None:
                 for idx, mut in enumerate(mutations):
                     st.markdown(f"#### Mutation {idx+1}: {mut.get('pattern_name', 'Unknown Pattern')}")
                     render_diff_viewer(mut.get('original_code', ''), mut.get('mutated_code', ''))
-                    
-                    m_id = mut.get('mutant_id')
-                    
-                    # 검증 결과가 있으면 표시, 없으면 버튼 표시
-                    if m_id in st.session_state["validation_results"]:
-                        val_res = st.session_state["validation_results"][m_id]
-                        st.success(f"Validation Complete! Survival Rate: **{val_res.get('survival_rate', 0):.1f}%**")
-                        if val_res.get("llm_score"):
-                            st.success(f"**Gemini AI Score:** {val_res.get('llm_score')}")
-                            if val_res.get("llm_rationale") or val_res.get("llm_reasoning"):
-                                rationale_text = val_res.get("llm_rationale") or val_res.get("llm_reasoning")
-                                st.info(f"**AI Rationale:** {rationale_text}")
-                    else:
-                        if st.button(f"Validate Mutant {m_id}", key=f"val_{idx}"):
-                            with st.spinner("Running validation pipeline in Docker..."):
-                                try:
-                                    val_res = validate_mutant(m_id, wait=True)
-                                    # 결과를 세션 상태에 저장하여 화면 리렌더링 시에도 유지
-                                    st.session_state["validation_results"][m_id] = val_res
-                                    st.rerun() # 화면 즉시 새로고침하여 결과 표시
-                                except Exception as e:
-                                    st.error(f"Validation Error: {e}")
-                    
+            
             st.markdown("---")
             st.markdown("### 3. Verification Tools")
             col_afl, col_gemini = st.columns(2)
+            
+            # 💡 수정 포인트 1: AFL++ 퍼저 버튼에 validate_mutant 로직 연결
             with col_afl:
-                st.button("Trigger AFL++ Fuzzer (Manual)", help="Manual re-run of AFL++")
+                if st.button("Trigger AFL++ Fuzzer (Validation)", help="Run AFL++ in Docker to calculate survival rate"):
+                    if not mutations:
+                        st.warning("검증할 뮤턴트가 없습니다. 파이프라인을 먼저 실행하십시오.")
+                    else:
+                        with st.spinner("Docker에서 AFL++ 검증 파이프라인 실행 중..."):
+                            success_count = 0
+                            for mut_item in mutations:
+                                current_m_id = mut_item.get('mutant_id')
+                                if current_m_id:
+                                    try:
+                                        val_res = validate_mutant(current_m_id, wait=True)
+                                        if current_m_id not in st.session_state["validation_results"]:
+                                            st.session_state["validation_results"][current_m_id] = {}
+                                        # 딕셔너리 업데이트 (기존 Gemini 데이터 유지)
+                                        st.session_state["validation_results"][current_m_id].update(val_res)
+                                        success_count += 1
+                                    except Exception as e:
+                                        st.error(f"Mutant {current_m_id} AFL++ 검증 중 오류 발생: {e}")
+                            
+                            if success_count > 0:
+                                st.success(f"{success_count}개 뮤턴트에 대한 AFL++ 무결성 검증을 완료했습니다!")
+                                st.rerun()
+
+            # 💡 수정 포인트 2: Gemini API 로직 유지 및 데이터 병합 처리
             with col_gemini:
                 if st.button("Trigger Gemini API Verification (Manual)", help="Run LLM analysis on mutants"):
                     if not mutations:
                         st.warning("평가할 뮤턴트가 없습니다. 파이프라인을 먼저 실행하십시오.")
                     else:
-                        with st.spinner("Gemini 정성 평가 수행 중..."):
+                        with st.spinner("Gemini 정성 평가 수행 중... (API Key를 확인하세요)"):
                             success_count = 0
-                            for val_idx, mut_item in enumerate(mutations):
+                            for mut_item in mutations:
                                 current_m_id = mut_item.get('mutant_id')
                                 if current_m_id:
                                     try:
                                         res = gemini_evaluate_mutant(current_m_id)
                                         if current_m_id not in st.session_state["validation_results"]:
                                             st.session_state["validation_results"][current_m_id] = {}
+                                            
                                         score = res.get("llm_score")
-                                        rationale = res.get("llm_rationale")
                                         st.session_state["validation_results"][current_m_id]["llm_score"] = f"{int(score)}/10" if score is not None else "N/A"
-                                        st.session_state["validation_results"][current_m_id]["llm_rationale"] = rationale
+                                        st.session_state["validation_results"][current_m_id]["llm_rationale"] = res.get("llm_rationale")
                                         success_count += 1
                                     except Exception as e:
                                         st.error(f"Mutant {current_m_id} Gemini 평가 중 오류 발생: {e}")
+                            
                             if success_count > 0:
                                 st.success(f"{success_count}개 뮤턴트에 대한 Gemini 정성 평가를 완료했습니다!")
                                 st.rerun()
+
+            # 💡 수정 포인트 3: 검증 결과(AFL++ 및 Gemini)를 통합하여 하단에 깔끔하게 표시
+            if st.session_state["validation_results"]:
+                st.markdown("#### 📊 Verification Results")
+                for mut_item in mutations:
+                    m_id = mut_item.get('mutant_id')
+                    res = st.session_state["validation_results"].get(m_id)
+                    
+                    if res:
+                        with st.container(border=True):
+                            st.markdown(f"**Mutant {m_id} ({mut_item.get('pattern_name', 'Unknown')})**")
+                            
+                            if 'survival_rate' in res:
+                                st.warning(f"🛡️ **AFL++ Survival Rate:** {res['survival_rate']:.1f}%")
+                                
+                            if 'llm_score' in res:
+                                st.success(f"🤖 **Gemini AI Score:** {res['llm_score']}")
+                                if res.get('llm_rationale'):
+                                    st.info(f"**Rationale:** {res['llm_rationale']}")
 
     with tab_history:
         st.markdown("### 📚 Injection History Dashboard")
