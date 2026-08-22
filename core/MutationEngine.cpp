@@ -64,7 +64,9 @@ static const std::map<int, std::string> PATTERN_REGISTRY = {
     {6, "CWE-682 Incorrect Calculation"},
     {7, "CWE-416 Use After Free (UAF)"},
     {8, "CWE-125/787 Out-of-bounds Access"},
-    {9, "CWE-362 Race Condition"},
+    {9, "CWE-457 Uninitialized Variable"},
+    {10, "CWE-369 Divide By Zero"},
+    {11, "CWE-835 Infinite Loop (Hang)"},
 };
 
 // JSON 이스케이프 헬퍼
@@ -155,22 +157,18 @@ public:
             }
         }
 
-        // ── CWE-390: 예외 처리 누락 ───────────────────────────
+        // ── [교묘한 버전] CWE-390: 예외 처리 누락 (throw 무력화) ───────────
         if (targetPatternId == 0 || targetPatternId == 3) {
-            if (const CXXCatchStmt* Catch = Result.Nodes.getNodeAs<CXXCatchStmt>("cwe390_catch")) {
-                if (const Stmt* Block = Catch->getHandlerBlock()) {
-                    Rewrite.ReplaceText(Block->getSourceRange(), "{}");
-                    mutations_log.push_back({3, "CWE-390 Detection of Error Condition Without Action", "injected"});
-                }
-            }
-            else if (const IfStmt* If = Result.Nodes.getNodeAs<IfStmt>("cwe390_if")) {
-                if (const Stmt* Then = If->getThen()) {
-                    Rewrite.ReplaceText(Then->getSourceRange(), "{}");
-                    mutations_log.push_back({3, "CWE-390 Detection of Error Condition Without Action", "injected"});
-                }
+            if (const CXXThrowExpr* ThrowExpr = Result.Nodes.getNodeAs<CXXThrowExpr>("cwe390_throw")) {
+                
+                // 에러를 던지는(throw) 코드를 주석 처리하여, 에러가 발생해도 시스템이 무시하고 계속 실행되게 만듦
+                // 컴파일 에러를 피하면서 아주 자연스러운 논리 결함을 유발함
+                Rewrite.ReplaceText(ThrowExpr->getSourceRange(), "/* throw ignored for debugging */");
+                
+                mutations_log.push_back({3, "CWE-390 Detection of Error Condition Without Action (Throw Ignored)", "injected"});
             }
         }
-
+        
         // ── CWE-401: 메모리 누수 ───────────────────────────
         if (targetPatternId == 0 || targetPatternId == 4) {
             if (const CXXDeleteExpr* DelExpr = Result.Nodes.getNodeAs<CXXDeleteExpr>("cwe401_delete")) {
@@ -189,20 +187,19 @@ public:
             }
         }
 
-        // ── CWE-476: NULL 포인터 역참조 ───────────────────────────
+        // ── [교묘한 버전] CWE-476: NULL 포인터 역참조 (방어 로직 반전) ───────────
         if (targetPatternId == 0 || targetPatternId == 5) {
-            if (const VarDecl* VD = Result.Nodes.getNodeAs<VarDecl>("cwe476_decl")) {
-                if (const Expr* Init = Result.Nodes.getNodeAs<Expr>("cwe476_init")) {
-                    Rewrite.ReplaceText(Init->getSourceRange(), "nullptr");
-                    mutations_log.push_back({5, "CWE-476 NULL Pointer Dereference", "injected"});
+            if (const BinaryOperator* BinOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe476_cond")) {
+                
+                // 개발자가 짜둔 방어 조건 (==)을 (!=)로, (!=)를 (==)로 한 글자 오타 냄
+                // 이로 인해 널 포인터일 때 방어막을 뚫고 지나가버림
+                if (BinOp->getOpcode() == BO_EQ) {
+                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 2, "!=");
+                } else if (BinOp->getOpcode() == BO_NE) {
+                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 2, "==");
                 }
-            } else if (const DeclStmt* DS = Result.Nodes.getNodeAs<DeclStmt>("cwe476_stmt")) {
-                SourceLocation insertLoc = DS->getEndLoc().getLocWithOffset(1);
-                Rewrite.InsertTextAfter(
-                    insertLoc,
-                    "\n*((int*)nullptr) = 0;"
-                );
-                mutations_log.push_back({5, "CWE-476 NULL Pointer Dereference", "injected"});
+                
+                mutations_log.push_back({5, "CWE-476 NULL Pointer Dereference (Inverted Logic)", "injected"});
             }
         }
 
@@ -261,20 +258,43 @@ public:
             }
         }
 
-        // ── [교묘한 버전] CWE-362: Race Condition (임시 객체 실수) ──────────────
+        // ── [교묘한 버전] CWE-457: 초기화 누락 주입 ───────────────────────
         if (targetPatternId == 0 || targetPatternId == 9) {
-            if (const VarDecl* LockVar = Result.Nodes.getNodeAs<VarDecl>("cwe362_lock")) {
-                // 선언된 락 변수의 이름(예: lock, guard 등)을 찾아 빈 문자열로 지워버림
-                std::string varName = LockVar->getNameAsString();
-                if (!varName.empty()) {
-                    SourceLocation nameLoc = LockVar->getLocation();
-                    // 변수명 길이만큼의 텍스트를 삭제하여 이름 없는 임시 객체로 만듦
-                    Rewrite.RemoveText(nameLoc, varName.length());
-                    
-                    mutations_log.push_back({9, "CWE-362 Race Condition (Temporary Lock Object)", "injected"});
-                }
+            if (const VarDecl* VD = Result.Nodes.getNodeAs<VarDecl>("cwe457_decl")) {
+                // 개발자가 'int count = 0;' 이라고 썼던 것을 'int count;' 로 바꿔버림 (할당값 유실)
+                // C++에서는 쓰레기 값(Garbage value)이 들어가게 되어 매우 찾기 힘든 비결정적 버그가 됨
+                std::string typeStr = VD->getType().getAsString();
+                std::string nameStr = VD->getNameAsString();
+                
+                Rewrite.ReplaceText(VD->getSourceRange(), typeStr + " " + nameStr);
+                mutations_log.push_back({9, "CWE-457 Uninitialized Variable", "injected"});
             }
         }
+
+        // ── [교묘한 버전] CWE-369: 0으로 나누기 (방어문 == 오타 유발) 주입 ──────────
+        if (targetPatternId == 0 || targetPatternId == 10) {
+            if (const BinaryOperator* CondOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe369_cond")) {
+                
+                // 개발자가 '==' 로 비교하려던 것을 '=' (대입)로 단 한 글자 수정
+                // 조건문은 무조건 false가 되어 통과되고, 변수는 0으로 오염되어 이후 나눗셈에서 크래시 발생!
+                Rewrite.ReplaceText(CondOp->getOperatorLoc(), 2, "=");
+                
+                mutations_log.push_back({10, "CWE-369 Divide By Zero (== to = typo bypass)", "injected"});
+            }
+        }
+
+        // ── [교묘한 버전] CWE-835: 무한 루프 / Hang 주입 (증감식 누락) ──────────
+        if (targetPatternId == 0 || targetPatternId == 11) {
+            if (const Expr* IncExpr = Result.Nodes.getNodeAs<Expr>("cwe835_inc")) {
+                // for(int i=0; i<n; i++) 에서 'i++' 부분을 주석 처리하여 무한 루프(Hang)에 빠지게 만듦
+                // 개발자가 디버깅 중 실수로 주석 처리하고 깜빡한 상황을 완벽하게 모방
+                Rewrite.ReplaceText(IncExpr->getSourceRange(), "/* loop increment removed */");
+                
+                mutations_log.push_back({11, "CWE-835 Infinite Loop (Missing Update)", "injected"});
+            }
+        }
+
+        
     }
 
 private:
@@ -314,22 +334,11 @@ public:
                 &Callback);
         }
 
+        // ── [교묘한 버전] CWE-390: 예외 처리 누락 (throw 문 찾기) ───────────
         if (all || patternId == 3) {
             Finder.addMatcher(
-                cxxCatchStmt(isExpansionInMainFile(),
-                             hasAncestor(functionDecl().bind("parent_func"))).bind("cwe390_catch"),
-                &Callback);
-            Finder.addMatcher(
-                ifStmt(isExpansionInMainFile(),
-                       hasThen(stmt(anyOf(
-                           returnStmt(),
-                           callExpr(callee(functionDecl(hasAnyName("abort", "exit")))),
-                           compoundStmt(hasAnySubstatement(anyOf(
-                               returnStmt(),
-                               callExpr(callee(functionDecl(hasAnyName("abort", "exit"))))
-                           )))
-                       ))),
-                       hasAncestor(functionDecl().bind("parent_func"))).bind("cwe390_if"),
+                cxxThrowExpr(isExpansionInMainFile(),
+                             hasAncestor(functionDecl().bind("parent_func"))).bind("cwe390_throw"),
                 &Callback);
         }
 
@@ -345,17 +354,15 @@ public:
                 &Callback);
         }
 
+        // ── [교묘한 버전] CWE-476: NULL 포인터 방어 로직 탐색 ───────────
         if (all || patternId == 5) {
             Finder.addMatcher(
-                varDecl(isExpansionInMainFile(),
-                        hasType(pointerType()),
-                        hasInitializer(expr().bind("cwe476_init")),
-                        hasAncestor(functionDecl().bind("parent_func"))).bind("cwe476_decl"),
-                &Callback);
-            Finder.addMatcher(
-                declStmt(isExpansionInMainFile(),
-                         containsDeclaration(0, varDecl(hasType(pointerType()))),
-                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe476_stmt"),
+                // if문 안에서 nullptr과 == 또는 != 로 비교하는 로직 찾기
+                binaryOperator(isExpansionInMainFile(),
+                               anyOf(hasOperatorName("=="), hasOperatorName("!=")),
+                               hasEitherOperand(ignoringParenImpCasts(cxxNullPtrLiteralExpr())),
+                               hasAncestor(ifStmt()),
+                               hasAncestor(functionDecl().bind("parent_func"))).bind("cwe476_cond"),
                 &Callback);
         }
 
@@ -391,14 +398,38 @@ public:
                 &Callback);
         }
 
-        // ── [추가] CWE-362: Race Condition 탐색 (Lock 제거) ──────────────
+        // ── [추가] CWE-457: 초기화되지 않은 정수형 변수 선언 탐색 ──────────
         if (all || patternId == 9) {
             Finder.addMatcher(
                 varDecl(isExpansionInMainFile(),
-                        hasType(recordDecl(hasName("std::lock_guard"))),
-                        hasAncestor(functionDecl().bind("parent_func"))).bind("cwe362_lock"),
+                        hasType(isInteger()), // 포인터(CWE-476)와 충돌하지 않도록 정수형으로 한정
+                        hasInitializer(expr().bind("cwe457_init")),
+                        hasAncestor(functionDecl().bind("parent_func"))).bind("cwe457_decl"),
                 &Callback);
         }
+
+        // ── [수정] CWE-369: 0으로 나누기 (방어문 == 오타 유발) 탐색 ──────────
+        if (all || patternId == 10) {
+            Finder.addMatcher(
+                ifStmt(isExpansionInMainFile(),
+                       hasCondition(
+                           // 조건식 안에 '== 0' 또는 '0 ==' 이 있는지 탐색
+                           binaryOperator(hasOperatorName("=="),
+                                          hasEitherOperand(integerLiteral(equals(0)))).bind("cwe369_cond")
+                       ),
+                       hasAncestor(functionDecl().bind("parent_func"))).bind("cwe369_if"),
+                &Callback);
+        }
+
+        // ── [추가] CWE-835: 무한 루프 탐색 (for문의 증감식 부분) ──────────
+        if (all || patternId == 11) {
+            Finder.addMatcher(
+                forStmt(isExpansionInMainFile(),
+                        hasIncrement(expr().bind("cwe835_inc")), // for(int i=0; i<10; i++) 에서 i++ 부분
+                        hasAncestor(functionDecl().bind("parent_func"))).bind("cwe835_loop"),
+                &Callback);
+        }
+    
         
     }
 
