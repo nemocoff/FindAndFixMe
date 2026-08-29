@@ -67,6 +67,9 @@ static const std::map<int, std::string> PATTERN_REGISTRY = {
     {9, "CWE-457 Uninitialized Variable"},
     {10, "CWE-369 Divide By Zero"},
     {11, "CWE-835 Infinite Loop (Hang)"},
+    {12, "CWE-131 Missing sizeof in memcpy"},
+    {13, "CWE-134 Uncontrolled Format String"},
+    {14, "CWE-415 Double Free (Copy-Paste Error)"},
 };
 
 // JSON 이스케이프 헬퍼
@@ -294,6 +297,56 @@ public:
             }
         }
 
+        // ── [검증 완료] CWE-131: 메모리 복사 크기 오류 주입 ───────────────────────
+        if (targetPatternId == 0 || targetPatternId == 12) {
+            if (const BinaryOperator* BinOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe131_binop")) {
+                std::string lhsStr = getExprString(BinOp->getLHS());
+                std::string rhsStr = getExprString(BinOp->getRHS());
+                
+                // 곱셈 연산 중 'sizeof'가 포함된 항을 찾아 제거하고, 요소 개수 변수만 남김
+                if (rhsStr.find("sizeof") != std::string::npos) {
+                    Rewrite.ReplaceText(BinOp->getSourceRange(), lhsStr);
+                    mutations_log.push_back({12, "CWE-131 Missing sizeof in memcpy", "injected"});
+                } else if (lhsStr.find("sizeof") != std::string::npos) {
+                    Rewrite.ReplaceText(BinOp->getSourceRange(), rhsStr);
+                    mutations_log.push_back({12, "CWE-131 Missing sizeof in memcpy", "injected"});
+                }
+            }
+        }
+
+        // ── [검증 완료] CWE-134: 통제되지 않은 포맷 스트링 주입 ──────────
+        if (targetPatternId == 0 || targetPatternId == 13) {
+            if (const CallExpr* Call = Result.Nodes.getNodeAs<CallExpr>("cwe134_call")) {
+                std::string callStr = getExprString(Call);
+                
+                // 함수 호출 문자열 전체에서 "%s", 부분을 찾아 삭제
+                size_t pos = callStr.find("\"%s\", ");
+                if (pos != std::string::npos) {
+                    callStr.replace(pos, 6, ""); 
+                    Rewrite.ReplaceText(Call->getSourceRange(), callStr);
+                    mutations_log.push_back({13, "CWE-134 Uncontrolled Format String", "injected"});
+                }
+            }
+        }
+
+        // ── [검증 완료] CWE-415: 이중 해제 (Copy-Paste Error) 주입 ──────────
+        if (targetPatternId == 0 || targetPatternId == 14) {
+            if (const CXXDeleteExpr* DelExpr = Result.Nodes.getNodeAs<CXXDeleteExpr>("cwe415_delete")) {
+                std::string ptrName = getExprString(DelExpr->getArgument());
+                
+                // 마스킹 방지: 다른 패턴(401, 416)에 의해 오염되지 않은 순수한 포인터인지 확인
+                if (corrupted_pointers.find(ptrName) == corrupted_pointers.end()) {
+                    corrupted_pointers.insert(ptrName); // 오염 상태로 등록
+                    
+                    // 기존 delete 구문 바로 다음 줄에 동일한 delete 구문을 한 번 더 붙여넣음
+                    std::string duplicateDelete = "\n    delete " + ptrName + ";";
+                    Rewrite.InsertTextAfter(DelExpr->getEndLoc().getLocWithOffset(1), duplicateDelete);
+                    
+                    mutations_log.push_back({14, "CWE-415 Double Free (Copy-Paste Error)", "injected"});
+                }
+            }w
+        }
+
         
     }
 
@@ -429,6 +482,33 @@ public:
                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe835_loop"),
                 &Callback);
         }
+
+        // ── [추가] CWE-131: memcpy/memset의 3번째 인자에서 곱셈 연산 찾기 ──────────
+        if (all || patternId == 12) {
+            Finder.addMatcher(
+                callExpr(isExpansionInMainFile(),
+                         callee(functionDecl(hasAnyName("memcpy", "memset", "memmove"))),
+                         hasArgument(2, binaryOperator(hasOperatorName("*")).bind("cwe131_binop")),
+                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe131_call"),
+                &Callback);
+        }
+
+        // ── [추가] CWE-134: 포맷 스트링 출력 함수 찾기 ──────────
+        if (all || patternId == 13) {
+            Finder.addMatcher(
+                callExpr(isExpansionInMainFile(),
+                         callee(functionDecl(hasAnyName("printf", "fprintf", "sprintf"))),
+                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe134_call"),
+                &Callback);
+        }
+
+        // ── [추가] CWE-415: 이중 해제를 위한 정상적인 delete 구문 찾기 ──────────
+        if (all || patternId == 14) {
+            Finder.addMatcher(
+                cxxDeleteExpr(isExpansionInMainFile(),
+                              hasAncestor(functionDecl().bind("parent_func"))).bind("cwe415_delete"),
+                &Callback);
+        }
     
         
     }
@@ -547,7 +627,7 @@ public:
         // [T10] 패턴 ID 유효성 검사
         if (patternId != 0 && PATTERN_REGISTRY.find(patternId) == PATTERN_REGISTRY.end()) {
             outputError("Invalid pattern-id: " + std::to_string(patternId) +
-                        ". Must be 0 (all) or 1~6.");
+                        ". Must be 0 (all) or 1~15.");
             return 1;
         }
 
