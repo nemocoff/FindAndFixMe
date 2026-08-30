@@ -212,7 +212,9 @@ def _compile_regular(source_path: str, binary_path: str) -> str:
         "-fno-PIE",
         "-no-pie",
         "-rdynamic",
-        "-ldl"
+        "-ldl",
+        "-Wno-format-security",
+        "-pthread"
     ]
     for src in all_sources_host:
         try:

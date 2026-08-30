@@ -147,28 +147,17 @@ public:
         }
 
         // ── [T10] CWE-193: 루프 언더-이터레이션 (마지막 원소 처리 누락) ─────────────
-        // 수정 전: i < n → i <= n (OOB → SIGSEGV, 생존률 매우 낮음)
-        // 수정 후: i < n → i < n - 1 (마지막 원소 미처리, 크래시 없음, 조용한 시맨틱 버그)
+        // RHS만 '(RHS) - 1'로 교체하여 좌항 및 루프 구문 손상 방지
         if (targetPatternId == 0 || targetPatternId == 2) {
             if (const BinaryOperator* BinOp =
                     Result.Nodes.getNodeAs<clang::BinaryOperator>("cwe193")) {
-                if (BinOp->getOpcode() == BO_LT) {
-                    // RHS가 변수인 경우: 'i < n' → 'i < n - 1' (마지막 원소 누락)
-                    std::string rhs = getExprString(BinOp->getRHS());
-                    if (!rhs.empty()) {
-                        std::string lhs = getExprString(BinOp->getLHS());
-                        Rewrite.ReplaceText(BinOp->getSourceRange(),
-                                            lhs + " < " + rhs + " - 1");
-                        mutations_log.push_back({2, "CWE-193 Boundary Condition Error (Under-iteration)", "injected"});
-                    }
-                } else if (BinOp->getOpcode() == BO_LE) {
-                    // 'i <= n' → 'i <= n - 1' (동일 효과)
-                    std::string rhs = getExprString(BinOp->getRHS());
-                    if (!rhs.empty()) {
-                        std::string lhs = getExprString(BinOp->getLHS());
-                        Rewrite.ReplaceText(BinOp->getSourceRange(),
-                                            lhs + " <= " + rhs + " - 1");
-                        mutations_log.push_back({2, "CWE-193 Boundary Condition Error (Under-iteration)", "injected"});
+                if (BinOp->getOpcode() == BO_LT || BinOp->getOpcode() == BO_LE) {
+                    if (const Expr* RHS = BinOp->getRHS()) {
+                        std::string rhs = getExprString(RHS);
+                        if (!rhs.empty()) {
+                            Rewrite.ReplaceText(RHS->getSourceRange(), "(" + rhs + ") - 1");
+                            mutations_log.push_back({2, "CWE-193 Boundary Condition Error (Under-iteration)", "injected"});
+                        }
                     }
                 }
             }
@@ -177,11 +166,7 @@ public:
         // ── [교묘한 버전] CWE-390: 예외 처리 누락 (throw 무력화) ───────────
         if (targetPatternId == 0 || targetPatternId == 3) {
             if (const CXXThrowExpr* ThrowExpr = Result.Nodes.getNodeAs<CXXThrowExpr>("cwe390_throw")) {
-                
-                // 에러를 던지는(throw) 코드를 주석 처리하여, 에러가 발생해도 시스템이 무시하고 계속 실행되게 만듦
-                // 컴파일 에러를 피하면서 아주 자연스러운 논리 결함을 유발함
                 Rewrite.ReplaceText(ThrowExpr->getSourceRange(), "/* throw ignored for debugging */");
-                
                 mutations_log.push_back({3, "CWE-390 Detection of Error Condition Without Action (Throw Ignored)", "injected"});
             }
         }
@@ -189,17 +174,15 @@ public:
         // ── CWE-401: 메모리 누수 ───────────────────────────
         if (targetPatternId == 0 || targetPatternId == 4) {
             if (const CXXDeleteExpr* DelExpr = Result.Nodes.getNodeAs<CXXDeleteExpr>("cwe401_delete")) {
-                // 포인터 변수명 추출 및 블랙리스트 등록
                 std::string ptrName = getExprString(DelExpr->getArgument());
                 corrupted_pointers.insert(ptrName);
-                Rewrite.ReplaceText(DelExpr->getSourceRange(), ";");
+                Rewrite.ReplaceText(DelExpr->getSourceRange(), "/* CWE-401: delete skipped */");
                 mutations_log.push_back({4, "CWE-401 Memory Leak", "injected"});
             }
             else if (const CallExpr* FreeCall = Result.Nodes.getNodeAs<CallExpr>("cwe401_free")) {
-                // 포인터 변수명 추출 및 블랙리스트 등록
-                std::string ptrName = getExprString(DelExpr->getArgument());
+                std::string ptrName = getExprString(FreeCall->getArg(0));
                 corrupted_pointers.insert(ptrName);
-                Rewrite.ReplaceText(FreeCall->getSourceRange(), ";");
+                Rewrite.ReplaceText(FreeCall->getSourceRange(), "/* CWE-401: free skipped */");
                 mutations_log.push_back({4, "CWE-401 Memory Leak", "injected"});
             }
         }
@@ -207,32 +190,24 @@ public:
         // ── [교묘한 버전] CWE-476: NULL 포인터 역참조 (방어 로직 반전) ───────────
         if (targetPatternId == 0 || targetPatternId == 5) {
             if (const BinaryOperator* BinOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe476_cond")) {
-                
-                // 개발자가 짜둔 방어 조건 (==)을 (!=)로, (!=)를 (==)로 한 글자 오타 냄
-                // 이로 인해 널 포인터일 때 방어막을 뚫고 지나가버림
                 if (BinOp->getOpcode() == BO_EQ) {
                     Rewrite.ReplaceText(BinOp->getOperatorLoc(), 2, "!=");
                 } else if (BinOp->getOpcode() == BO_NE) {
                     Rewrite.ReplaceText(BinOp->getOperatorLoc(), 2, "==");
                 }
-                
                 mutations_log.push_back({5, "CWE-476 NULL Pointer Dereference (Inverted Logic)", "injected"});
             }
         }
 
         // ── CWE-682: 논리/비트 연산자 혼동 (크래시 없는 시맨틱 오류만) ──────────────
-        // 수정 전: % ↔ / 교체 포함 → div-by-zero → SIGFPE 가능
-        // 수정 후: &&↔& / ||↔| 교체만 허용 → 크래시 없는 조건 평가 오류
         if (targetPatternId == 0 || targetPatternId == 6) {
             if (const BinaryOperator* BinOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe682")) {
                 std::string rep = "";
                 unsigned opLen = BinOp->getOpcodeStr().size();
-                // 논리↔비트 교체만 허용 (단락 평가 vs 전체 평가 차이로 크래시 없이 오작동)
                 if      (BinOp->getOpcode() == BO_LAnd) { rep = "&";  }  // && → &
                 else if (BinOp->getOpcode() == BO_LOr)  { rep = "|";  }  // || → |
                 else if (BinOp->getOpcode() == BO_And)  { rep = "&&"; }  // & → &&
                 else if (BinOp->getOpcode() == BO_Or)   { rep = "||"; }  // | → ||
-                // BO_Rem(%), BO_Div(/), BO_Mul(*) 제거: div-by-zero(SIGFPE) 위험
 
                 if (!rep.empty()) {
                     Rewrite.ReplaceText(BinOp->getOperatorLoc(), opLen, rep);
@@ -242,10 +217,8 @@ public:
         }
 
         // ── [자연스러운 버전] CWE-416: Use After Free (Dangling Pointer 유발) ──────────
-        // (참고: 탐색 조건에서 'ptr = nullptr;' 같은 할당문(BinaryOperator)을 찾았다고 가정)
         if (targetPatternId == 0 || targetPatternId == 7) {
             if (const BinaryOperator* NullAssign = Result.Nodes.getNodeAs<BinaryOperator>("cwe416_null_assign")) {
-                // 이미 누수(401) 처리된 포인터인지 확인하여 마스킹 방지
                 std::string ptrName = getExprString(NullAssign->getLHS());
                 if (corrupted_pointers.find(ptrName) != corrupted_pointers.end()) {
                     return; // 이미 오염된 포인터면 주입 생략
@@ -259,69 +232,46 @@ public:
         // ── [수정] CWE-125/787: OOB (할당 크기 축소) 주입 ───────────────────
         if (targetPatternId == 0 || targetPatternId == 8) {
             if (const CXXNewExpr* NewExpr = Result.Nodes.getNodeAs<CXXNewExpr>("cwe_oob_alloc")) {
-                
-                // Clang AST에서 배열의 크기 지정 수식(예: len, size, 10 등)을 가져옴
                 if (const Expr* ArraySizeExpr = NewExpr->getArraySize().value_or(nullptr)) {
                     std::string sizeStr = getExprString(ArraySizeExpr);
-                    
                     if (!sizeStr.empty()) {
-                        // 원래 크기에서 1을 빼서 버퍼를 작게 만듦 (예: new int[len] -> new int[(len) - 1])
                         std::string mutatedSize = "(" + sizeStr + ") - 1";
-                        
                         Rewrite.ReplaceText(ArraySizeExpr->getSourceRange(), mutatedSize);
-                        
                         mutations_log.push_back({8, "CWE-125/787 OOB (Buffer Under-allocation)", "injected"});
                     }
                 }
             }
         }
 
-        // ── [교묘한 버전] CWE-457: 초기화 누락 주입 ───────────────────────
+        // ── [교묘한 버전] CWE-457: 초기화 누락 주입 (쓰레기값 시뮬레이션) ───
         if (targetPatternId == 0 || targetPatternId == 9) {
             if (const VarDecl* VD = Result.Nodes.getNodeAs<VarDecl>("cwe457_decl")) {
-                // 개발자가 'int count = 0;' 이라고 썼던 것을 'int count;' 로 바꿔버림 (할당값 유실)
-                // C++에서는 쓰레기 값(Garbage value)이 들어가게 되어 매우 찾기 힘든 비결정적 버그가 됨
-                std::string typeStr = VD->getType().getAsString();
-                std::string nameStr = VD->getNameAsString();
-                
-                Rewrite.ReplaceText(VD->getSourceRange(), typeStr + " " + nameStr);
-                mutations_log.push_back({9, "CWE-457 Uninitialized Variable", "injected"});
+                if (const Expr* Init = VD->getInit()) {
+                    // 초기화 표현식 '0'을 쓰레기값(Garbage value)으로 치환
+                    Rewrite.ReplaceText(Init->getSourceRange(), "(int)0xCCCCCCCC");
+                    mutations_log.push_back({9, "CWE-457 Uninitialized Variable (Garbage Value)", "injected"});
+                }
             }
         }
 
         // ── [수정] CWE-369: 0으로 나누기 (방어 조건 확장) 주입 ──────────
-        // 수정 전: '== 0' → '!= 0' → divisor==0 일 때 방어 무력화 → SIGFPE (생존 낮음)
-        // 수정 후: '== 0' → '>= 0' → 분모가 0이어도 guard가 true → 항상 -1 반환
-        //          실제 나눗셈 없음 (0으로 나누지 않음) → 크래시 없음 → 다만 틀린 결과값 반환
-        //          cwe369_compute_ratio: 'denominator == 0' → 'denominator >= 0'
-        //          → 항상 denominator=1로 대체 → 나눗셈 결과만 달라짐, 크래시 없음
         if (targetPatternId == 0 || targetPatternId == 10) {
             if (const BinaryOperator* CondOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe369_cond")) {
-                // '== 0' → '>= 0': divisor가 0 이상일 때만 조건 true (0 이상은 항상 true)
-                // 분모는 대체값(1)이 설정되거나 오류 코드 반환 → 실제 나눗셈 발생 없음
-                // SIGFPE 발생 없음 → exit code 동일 → survived
                 Rewrite.ReplaceText(CondOp->getOperatorLoc(), 2, ">=");
                 mutations_log.push_back({10, "CWE-369 Divide By Zero (Guard Over-broadening)", "injected"});
             }
         }
 
         // ── [수정] CWE-835: 루프 스킵 주입 (증감식 2배속) ──────────
-        // 수정 전: i++ → 주석 처리 → 무한 루프 → timeout → exit code 차이 → killed
-        // 수정 후: i++ → i += 2 (짝수 인덱스만 처리, 홀수 원소 누락, 종료는 정상)
-        // 효과: 루프는 정상 종료, 처리 결과만 달라짐 → exit code 동일 → survived
         if (targetPatternId == 0 || targetPatternId == 11) {
             if (const Expr* IncExpr = Result.Nodes.getNodeAs<Expr>("cwe835_inc")) {
                 std::string incStr = getExprString(IncExpr);
-                // i++ / ++i → i += 2  (짝수 원소만 처리하는 조용한 버그)
                 if (!incStr.empty()) {
-                    // 변수명 추출: 'i++', '++i', 'idx++' 등에서 변수명만
                     std::string varName = incStr;
-                    // 후위/전위 ++ 제거
                     if (varName.size() >= 2 && varName.substr(varName.size()-2) == "++")
                         varName = varName.substr(0, varName.size()-2);
                     else if (varName.size() >= 2 && varName.substr(0, 2) == "++")
                         varName = varName.substr(2);
-                    // 공백 제거
                     while (!varName.empty() && varName[0] == ' ') varName = varName.substr(1);
                     while (!varName.empty() && varName.back() == ' ') varName.pop_back();
 
@@ -337,8 +287,6 @@ public:
             if (const BinaryOperator* BinOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe131_binop")) {
                 std::string lhsStr = getExprString(BinOp->getLHS());
                 std::string rhsStr = getExprString(BinOp->getRHS());
-                
-                // 곱셈 연산 중 'sizeof'가 포함된 항을 찾아 제거하고, 요소 개수 변수만 남김
                 if (rhsStr.find("sizeof") != std::string::npos) {
                     Rewrite.ReplaceText(BinOp->getSourceRange(), lhsStr);
                     mutations_log.push_back({12, "CWE-131 Missing sizeof in memcpy", "injected"});
@@ -353,8 +301,6 @@ public:
         if (targetPatternId == 0 || targetPatternId == 13) {
             if (const CallExpr* Call = Result.Nodes.getNodeAs<CallExpr>("cwe134_call")) {
                 std::string callStr = getExprString(Call);
-                
-                // 함수 호출 문자열 전체에서 "%s", 부분을 찾아 삭제
                 size_t pos = callStr.find("\"%s\", ");
                 if (pos != std::string::npos) {
                     callStr.replace(pos, 6, ""); 
@@ -365,24 +311,17 @@ public:
         }
 
         // ── [수정] CWE-415: Null-After-Free 누락 주입 ──────────
-        // 수정 전: 동일 delete 한 번 더 삽입 → 이중 해제 → heap 오염 → SIGABRT
-        // 수정 후: delete 후 ptr=nullptr 라인을 주석 처리 → 같은 블록 내 재참조 방지 누락
-        //          실제로는 ptr이 dangling인 상태이지만 별도 사용이 없으면 크래시 없음
-        //          (CWE-416과 유사하지만 더 자연스러운 copy-paste 오류 맥락)
         if (targetPatternId == 0 || targetPatternId == 14) {
             if (const CXXDeleteExpr* DelExpr = Result.Nodes.getNodeAs<CXXDeleteExpr>("cwe415_delete")) {
                 std::string ptrName = getExprString(DelExpr->getArgument());
-
-                // 마스킹 방지: 다른 패턴(401, 416)에 의해 오염되지 않은 포인터인지 확인
                 if (corrupted_pointers.find(ptrName) == corrupted_pointers.end()) {
                     corrupted_pointers.insert(ptrName);
-
-                    // delete 뒤에 'ptr = nullptr;' 대신 주석만 삽입
-                    // → dangling pointer가 남아있지만 즉시 사용하지 않으면 크래시 없음
-                    std::string safetyNote = "\n    /* CWE-415: missing ptr = nullptr; after delete */";
-                    Rewrite.InsertTextAfter(DelExpr->getEndLoc().getLocWithOffset(1), safetyNote);
-
-                    mutations_log.push_back({14, "CWE-415 Double Free (Missing nullptr Reset)", "injected"});
+                    std::string delStr = getExprString(DelExpr);
+                    if (!delStr.empty()) {
+                        Rewrite.ReplaceText(DelExpr->getSourceRange(),
+                                            delStr + " /* CWE-415: dangling */");
+                        mutations_log.push_back({14, "CWE-415 Double Free (Missing nullptr Reset)", "injected"});
+                    }
                 }
             }
         }
@@ -500,6 +439,7 @@ public:
                 varDecl(isExpansionInMainFile(),
                         hasType(isInteger()),
                         hasInitializer(ignoringImplicit(integerLiteral(equals(0)))),
+                        unless(hasAncestor(forStmt())), // for 루프 변수(int i = 0)는 제외
                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe457_decl"),
                 &Callback);
         }
