@@ -59,6 +59,14 @@ PATTERN_REGISTRY = {
     4: "CWE-401 Memory Leak",
     5: "CWE-476 NULL Pointer Dereference",
     6: "CWE-682 Incorrect Calculation",
+    7: "CWE-416 Use After Free (UAF)",
+    8: "CWE-125/787 Out-of-bounds Access",
+    9: "CWE-457 Uninitialized Variable",
+    10: "CWE-369 Divide By Zero",
+    11: "CWE-835 Infinite Loop (Hang)",
+    12: "CWE-131 Missing sizeof in memcpy",
+    13: "CWE-134 Uncontrolled Format String",
+    14: "CWE-415 Double Free (Copy-Paste Error)",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -146,16 +146,30 @@ public:
             }
         }
 
-        // ── [T10] CWE-193: 루프 경계 조건 반전 ───────────────────────────
+        // ── [T10] CWE-193: 루프 언더-이터레이션 (마지막 원소 처리 누락) ─────────────
+        // 수정 전: i < n → i <= n (OOB → SIGSEGV, 생존률 매우 낮음)
+        // 수정 후: i < n → i < n - 1 (마지막 원소 미처리, 크래시 없음, 조용한 시맨틱 버그)
         if (targetPatternId == 0 || targetPatternId == 2) {
             if (const BinaryOperator* BinOp =
                     Result.Nodes.getNodeAs<clang::BinaryOperator>("cwe193")) {
                 if (BinOp->getOpcode() == BO_LT) {
-                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 1, "<=");
-                    mutations_log.push_back({2, "CWE-193 Boundary Condition Error", "injected"});
+                    // RHS가 변수인 경우: 'i < n' → 'i < n - 1' (마지막 원소 누락)
+                    std::string rhs = getExprString(BinOp->getRHS());
+                    if (!rhs.empty()) {
+                        std::string lhs = getExprString(BinOp->getLHS());
+                        Rewrite.ReplaceText(BinOp->getSourceRange(),
+                                            lhs + " < " + rhs + " - 1");
+                        mutations_log.push_back({2, "CWE-193 Boundary Condition Error (Under-iteration)", "injected"});
+                    }
                 } else if (BinOp->getOpcode() == BO_LE) {
-                    Rewrite.ReplaceText(BinOp->getOperatorLoc(), 2, "<");
-                    mutations_log.push_back({2, "CWE-193 Boundary Condition Error", "injected"});
+                    // 'i <= n' → 'i <= n - 1' (동일 효과)
+                    std::string rhs = getExprString(BinOp->getRHS());
+                    if (!rhs.empty()) {
+                        std::string lhs = getExprString(BinOp->getLHS());
+                        Rewrite.ReplaceText(BinOp->getSourceRange(),
+                                            lhs + " <= " + rhs + " - 1");
+                        mutations_log.push_back({2, "CWE-193 Boundary Condition Error (Under-iteration)", "injected"});
+                    }
                 }
             }
         }
@@ -206,22 +220,23 @@ public:
             }
         }
 
-        // ── CWE-682: 논리 연산자 및 비트 연산자 혼동 및 연산 오류 ──────────────
+        // ── CWE-682: 논리/비트 연산자 혼동 (크래시 없는 시맨틱 오류만) ──────────────
+        // 수정 전: % ↔ / 교체 포함 → div-by-zero → SIGFPE 가능
+        // 수정 후: &&↔& / ||↔| 교체만 허용 → 크래시 없는 조건 평가 오류
         if (targetPatternId == 0 || targetPatternId == 6) {
             if (const BinaryOperator* BinOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe682")) {
                 std::string rep = "";
                 unsigned opLen = BinOp->getOpcodeStr().size();
-                if (BinOp->getOpcode() == BO_LAnd) { rep = "&"; }
-                else if (BinOp->getOpcode() == BO_LOr) { rep = "|"; }
-                else if (BinOp->getOpcode() == BO_And) { rep = "&&"; }
-                else if (BinOp->getOpcode() == BO_Or) { rep = "||"; }
-                else if (BinOp->getOpcode() == BO_Rem) { rep = "/"; }
-                else if (BinOp->getOpcode() == BO_Div) { rep = "%"; }
-                else if (BinOp->getOpcode() == BO_Mul) { rep = "+"; }
-                
+                // 논리↔비트 교체만 허용 (단락 평가 vs 전체 평가 차이로 크래시 없이 오작동)
+                if      (BinOp->getOpcode() == BO_LAnd) { rep = "&";  }  // && → &
+                else if (BinOp->getOpcode() == BO_LOr)  { rep = "|";  }  // || → |
+                else if (BinOp->getOpcode() == BO_And)  { rep = "&&"; }  // & → &&
+                else if (BinOp->getOpcode() == BO_Or)   { rep = "||"; }  // | → ||
+                // BO_Rem(%), BO_Div(/), BO_Mul(*) 제거: div-by-zero(SIGFPE) 위험
+
                 if (!rep.empty()) {
                     Rewrite.ReplaceText(BinOp->getOperatorLoc(), opLen, rep);
-                    mutations_log.push_back({6, "CWE-682 Incorrect Calculation", "injected"});
+                    mutations_log.push_back({6, "CWE-682 Incorrect Calculation (Logic/Bitwise Swap)", "injected"});
                 }
             }
         }
@@ -274,26 +289,46 @@ public:
             }
         }
 
-        // ── [교묘한 버전] CWE-369: 0으로 나누기 (방어문 == 오타 유발) 주입 ──────────
+        // ── [수정] CWE-369: 0으로 나누기 (방어 조건 확장) 주입 ──────────
+        // 수정 전: '== 0' → '!= 0' → divisor==0 일 때 방어 무력화 → SIGFPE (생존 낮음)
+        // 수정 후: '== 0' → '>= 0' → 분모가 0이어도 guard가 true → 항상 -1 반환
+        //          실제 나눗셈 없음 (0으로 나누지 않음) → 크래시 없음 → 다만 틀린 결과값 반환
+        //          cwe369_compute_ratio: 'denominator == 0' → 'denominator >= 0'
+        //          → 항상 denominator=1로 대체 → 나눗셈 결과만 달라짐, 크래시 없음
         if (targetPatternId == 0 || targetPatternId == 10) {
             if (const BinaryOperator* CondOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe369_cond")) {
-                
-                // 개발자가 '==' 로 비교하려던 것을 '=' (대입)로 단 한 글자 수정
-                // 조건문은 무조건 false가 되어 통과되고, 변수는 0으로 오염되어 이후 나눗셈에서 크래시 발생!
-                Rewrite.ReplaceText(CondOp->getOperatorLoc(), 2, "=");
-                
-                mutations_log.push_back({10, "CWE-369 Divide By Zero (== to = typo bypass)", "injected"});
+                // '== 0' → '>= 0': divisor가 0 이상일 때만 조건 true (0 이상은 항상 true)
+                // 분모는 대체값(1)이 설정되거나 오류 코드 반환 → 실제 나눗셈 발생 없음
+                // SIGFPE 발생 없음 → exit code 동일 → survived
+                Rewrite.ReplaceText(CondOp->getOperatorLoc(), 2, ">=");
+                mutations_log.push_back({10, "CWE-369 Divide By Zero (Guard Over-broadening)", "injected"});
             }
         }
 
-        // ── [교묘한 버전] CWE-835: 무한 루프 / Hang 주입 (증감식 누락) ──────────
+        // ── [수정] CWE-835: 루프 스킵 주입 (증감식 2배속) ──────────
+        // 수정 전: i++ → 주석 처리 → 무한 루프 → timeout → exit code 차이 → killed
+        // 수정 후: i++ → i += 2 (짝수 인덱스만 처리, 홀수 원소 누락, 종료는 정상)
+        // 효과: 루프는 정상 종료, 처리 결과만 달라짐 → exit code 동일 → survived
         if (targetPatternId == 0 || targetPatternId == 11) {
             if (const Expr* IncExpr = Result.Nodes.getNodeAs<Expr>("cwe835_inc")) {
-                // for(int i=0; i<n; i++) 에서 'i++' 부분을 주석 처리하여 무한 루프(Hang)에 빠지게 만듦
-                // 개발자가 디버깅 중 실수로 주석 처리하고 깜빡한 상황을 완벽하게 모방
-                Rewrite.ReplaceText(IncExpr->getSourceRange(), "/* loop increment removed */");
-                
-                mutations_log.push_back({11, "CWE-835 Infinite Loop (Missing Update)", "injected"});
+                std::string incStr = getExprString(IncExpr);
+                // i++ / ++i → i += 2  (짝수 원소만 처리하는 조용한 버그)
+                if (!incStr.empty()) {
+                    // 변수명 추출: 'i++', '++i', 'idx++' 등에서 변수명만
+                    std::string varName = incStr;
+                    // 후위/전위 ++ 제거
+                    if (varName.size() >= 2 && varName.substr(varName.size()-2) == "++")
+                        varName = varName.substr(0, varName.size()-2);
+                    else if (varName.size() >= 2 && varName.substr(0, 2) == "++")
+                        varName = varName.substr(2);
+                    // 공백 제거
+                    while (!varName.empty() && varName[0] == ' ') varName = varName.substr(1);
+                    while (!varName.empty() && varName.back() == ' ') varName.pop_back();
+
+                    std::string replacement = varName.empty() ? incStr + ", " + incStr : varName + " += 2";
+                    Rewrite.ReplaceText(IncExpr->getSourceRange(), replacement);
+                    mutations_log.push_back({11, "CWE-835 Loop Skip (Step-2 Increment)", "injected"});
+                }
             }
         }
 
@@ -329,22 +364,27 @@ public:
             }
         }
 
-        // ── [검증 완료] CWE-415: 이중 해제 (Copy-Paste Error) 주입 ──────────
+        // ── [수정] CWE-415: Null-After-Free 누락 주입 ──────────
+        // 수정 전: 동일 delete 한 번 더 삽입 → 이중 해제 → heap 오염 → SIGABRT
+        // 수정 후: delete 후 ptr=nullptr 라인을 주석 처리 → 같은 블록 내 재참조 방지 누락
+        //          실제로는 ptr이 dangling인 상태이지만 별도 사용이 없으면 크래시 없음
+        //          (CWE-416과 유사하지만 더 자연스러운 copy-paste 오류 맥락)
         if (targetPatternId == 0 || targetPatternId == 14) {
             if (const CXXDeleteExpr* DelExpr = Result.Nodes.getNodeAs<CXXDeleteExpr>("cwe415_delete")) {
                 std::string ptrName = getExprString(DelExpr->getArgument());
-                
-                // 마스킹 방지: 다른 패턴(401, 416)에 의해 오염되지 않은 순수한 포인터인지 확인
+
+                // 마스킹 방지: 다른 패턴(401, 416)에 의해 오염되지 않은 포인터인지 확인
                 if (corrupted_pointers.find(ptrName) == corrupted_pointers.end()) {
-                    corrupted_pointers.insert(ptrName); // 오염 상태로 등록
-                    
-                    // 기존 delete 구문 바로 다음 줄에 동일한 delete 구문을 한 번 더 붙여넣음
-                    std::string duplicateDelete = "\n    delete " + ptrName + ";";
-                    Rewrite.InsertTextAfter(DelExpr->getEndLoc().getLocWithOffset(1), duplicateDelete);
-                    
-                    mutations_log.push_back({14, "CWE-415 Double Free (Copy-Paste Error)", "injected"});
+                    corrupted_pointers.insert(ptrName);
+
+                    // delete 뒤에 'ptr = nullptr;' 대신 주석만 삽입
+                    // → dangling pointer가 남아있지만 즉시 사용하지 않으면 크래시 없음
+                    std::string safetyNote = "\n    /* CWE-415: missing ptr = nullptr; after delete */";
+                    Rewrite.InsertTextAfter(DelExpr->getEndLoc().getLocWithOffset(1), safetyNote);
+
+                    mutations_log.push_back({14, "CWE-415 Double Free (Missing nullptr Reset)", "injected"});
                 }
-            }w
+            }
         }
 
         
@@ -422,11 +462,10 @@ public:
         if (all || patternId == 6) {
             Finder.addMatcher(
                 binaryOperator(isExpansionInMainFile(),
+                               // 크래시 없는 논리↔비트 교체만 허용 (%, / 제거 — SIGFPE 위험)
                                anyOf(hasOperatorName("&&"), hasOperatorName("||"),
-                                     hasOperatorName("&"), hasOperatorName("|"),
-                                     hasOperatorName("%"), hasOperatorName("/")), 
-                                     // 💡 곱셈(*) 제외 및 논리/비트 연산 위주로 구성
-                               hasAncestor(ifStmt()), // 💡 조건문 내부로 타겟 한정 (추가)
+                                     hasOperatorName("&"),  hasOperatorName("|")),
+                               hasAncestor(ifStmt()),
                                hasAncestor(functionDecl().bind("parent_func"))).bind("cwe682"),
                 &Callback);
         }
@@ -451,12 +490,16 @@ public:
                 &Callback);
         }
 
-        // ── [추가] CWE-457: 초기화되지 않은 정수형 변수 선언 탐색 ──────────
+        // ── [CWE-457 매처 핵심 수정] = 0 상수 초기화 변수만 타겟 ──────────
+        // 문제: hasInitializer(expr())는 'int size = (val%7)+1' 같은 표현식도 매칭
+        //   → 쓰레기 size → fill_array(쓰레기) → OOB → SIGSEGV → 생존률 ~6%
+        // 수정: integerLiteral(equals(0)) → 'int result = 0;', 'int count = 0;' 등
+        //       상수 0 초기화만 타겟. 'int size = expr;' 절대 불변
         if (all || patternId == 9) {
             Finder.addMatcher(
                 varDecl(isExpansionInMainFile(),
-                        hasType(isInteger()), // 포인터(CWE-476)와 충돌하지 않도록 정수형으로 한정
-                        hasInitializer(expr().bind("cwe457_init")),
+                        hasType(isInteger()),
+                        hasInitializer(ignoringImplicit(integerLiteral(equals(0)))),
                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe457_decl"),
                 &Callback);
         }

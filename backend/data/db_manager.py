@@ -127,7 +127,7 @@ class TraceDBManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     program_id INTEGER NOT NULL,
                     node_id INTEGER,
-                    injected_pattern_id INTEGER CHECK(injected_pattern_id BETWEEN 1 AND 6),
+                    injected_pattern_id INTEGER CHECK(injected_pattern_id >= 1),
                     mutated_code TEXT NOT NULL,
                     mutant_binary_path TEXT,
                     survival_rate REAL,
@@ -141,6 +141,35 @@ class TraceDBManager:
                     FOREIGN KEY(node_id) REFERENCES CornerCaseNode(id)
                 )
             ''')
+
+            # migration: injected_pattern_id CHECK 제약조건 범위 확장 (1~6 -> >= 1)
+            try:
+                schema_row = cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='MutantRecord'").fetchone()
+                if schema_row and "BETWEEN 1 AND 6" in schema_row[0]:
+                    cursor.execute("""
+                        CREATE TABLE MutantRecord_migrated (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            program_id INTEGER NOT NULL,
+                            node_id INTEGER,
+                            injected_pattern_id INTEGER CHECK(injected_pattern_id >= 1),
+                            mutated_code TEXT NOT NULL,
+                            mutant_binary_path TEXT,
+                            survival_rate REAL,
+                            llm_score REAL,
+                            llm_rationale TEXT,
+                            total_execs INTEGER,
+                            validated_at TIMESTAMP,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            injected_pattern_name TEXT,
+                            FOREIGN KEY(program_id) REFERENCES TargetProgram(id),
+                            FOREIGN KEY(node_id) REFERENCES CornerCaseNode(id)
+                        )
+                    """)
+                    cursor.execute("INSERT INTO MutantRecord_migrated SELECT * FROM MutantRecord")
+                    cursor.execute("DROP TABLE MutantRecord")
+                    cursor.execute("ALTER TABLE MutantRecord_migrated RENAME TO MutantRecord")
+            except Exception as e:
+                print(f"[DB Migration Error - MutantRecord CHECK] {e}")
 
             # migration: total_execs 컬럼 추가
             try:

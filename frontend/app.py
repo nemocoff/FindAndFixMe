@@ -238,6 +238,39 @@ def create_pdf_report(record):
                 if op1 != op2:
                     if any(op1 in del_line for del_line in deleted_lines) and any(op2 in add_line for add_line in added_lines):
                         detected.add('CWE-682')
+
+        # CWE-416 Use After Free
+        if '/* Forgot to nullify pointer */' in added_text or '/* CWE-416' in added_text:
+            detected.add('CWE-416')
+
+        # CWE-125 / CWE-787 Out-of-bounds Access
+        if '- 1' in added_text and ('new ' in added_text or 'new ' in deleted_text):
+            detected.add('CWE-125')
+            detected.add('CWE-787')
+
+        # CWE-457 Uninitialized Variable
+        if any(re.search(r'\b(int|short|long|unsigned)\s+\w+\s*;', add_l) for add_l in added_lines):
+            detected.add('CWE-457')
+
+        # CWE-369 Divide By Zero
+        if '>=' in added_text and '==' in deleted_text:
+            detected.add('CWE-369')
+
+        # CWE-835 Infinite Loop (Hang)
+        if '+= 2' in added_text or '/* loop increment removed */' in added_text:
+            detected.add('CWE-835')
+
+        # CWE-131 Missing sizeof in memcpy
+        if 'sizeof' in deleted_text and 'sizeof' not in added_text:
+            detected.add('CWE-131')
+
+        # CWE-134 Uncontrolled Format String
+        if '"%s"' in deleted_text and '"%s"' not in added_text:
+            detected.add('CWE-134')
+
+        # CWE-415 Double Free (Copy-Paste Error)
+        if '/* CWE-415' in added_text or '/* missing ptr = nullptr;' in added_text:
+            detected.add('CWE-415')
                         
         valid_detected = {c for c in detected if c in cwe_candidates}
         if valid_detected:
@@ -324,7 +357,15 @@ def main() -> None:
             3: "CWE-390 Detection of Error Condition Without Action",
             4: "CWE-401 Memory Leak",
             5: "CWE-476 NULL Pointer Dereference",
-            6: "CWE-682 Incorrect Calculation"
+            6: "CWE-682 Incorrect Calculation",
+            7: "CWE-416 Use After Free (UAF)",
+            8: "CWE-125/787 Out-of-bounds Access",
+            9: "CWE-457 Uninitialized Variable",
+            10: "CWE-369 Divide By Zero",
+            11: "CWE-835 Infinite Loop (Hang)",
+            12: "CWE-131 Missing sizeof in memcpy",
+            13: "CWE-134 Uncontrolled Format String",
+            14: "CWE-415 Double Free (Copy-Paste Error)",
         }
         selected_pattern_id = st.selectbox(
             "Select Vulnerability Pattern to Inject",
