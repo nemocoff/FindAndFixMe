@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import requests
 import re
@@ -11,15 +12,15 @@ from api_client import (
 from components.trace_tree import render_trace_tree_and_table
 from components.diff_viewer import render_diff_viewer, render_rich_diff_viewer
 
-API_BASE_URL = "http://localhost:8000/api/v1"
+API_BASE_URL = os.environ.get("FINDANDFIXME_API_URL", "http://localhost:8000/api/v1")
 
-def _run_pipeline_ui(prog_id: int, status_container, pattern_options, selected_pattern_id):
+def _run_pipeline_ui(prog_id: int, status_container, pattern_options, selected_pattern_id, fuzz_seconds: int = 60):
     """File Upload와 Github Import에서 공통으로 사용하는 파이프라인 UI 로직"""
     st.write("Compiling target and extracting AST (with auto-flags)...")
     compile_target(prog_id, wait=True)
-    
-    st.write("Running AFL++ Fuzzer to collect traces...")
-    res_traces = collect_traces(prog_id, fuzz_seconds=60, wait=True)
+
+    st.write(f"Running AFL++ Fuzzer to collect traces ({fuzz_seconds}s)...")
+    res_traces = collect_traces(prog_id, fuzz_seconds=fuzz_seconds, wait=True)
     
     st.write("Identifying Corner Cases from execution traces...")
     res_cc = get_corner_cases(prog_id)
@@ -34,8 +35,15 @@ def _run_pipeline_ui(prog_id: int, status_container, pattern_options, selected_p
         st.session_state["analysis_result"] = {"status": "success", "data": {"mutations": []}, "program_id": prog_id}
     else:
         st.write(f"Found {len(cc_list)} corner cases! Injecting {pattern_options[selected_pattern_id]} Mutation...")
-        target_node = cc_list[0]["id"]
+        queue_ccs = [c for c in cc_list if c.get("node_type") == "afl_queue"]
+        if queue_ccs:
+            coldest = min(queue_ccs, key=lambda c: c.get("exec_frequency", 1))
+            target_node = coldest["id"]
+            st.write(f"Targeting rarest living path (corner {target_node}, freq={coldest.get('exec_frequency', 0):.4f})...")
+        else:
+            target_node = cc_list[0]["id"]
         res_mut = inject_mutation(target_node, selected_pattern_id, wait=True)
+        st.session_state.setdefault("injected_nodes", set()).add(target_node)
 
         st.write("Solving path constraints with Z3 SMT Solver for all corner cases...")
         trigger_input = ""
@@ -72,10 +80,16 @@ def create_pdf_report(record):
     pdf.add_page()
     
     # 폰트 로드 (경로 주의)
-    pdf.add_font("D2CodingBold", "", "fonts/D2CodingBold.ttf")
-    pdf.add_font("D2Coding", "", "fonts/D2Coding.ttf")
+    USE_D2 = True
+    try:
+        pdf.add_font("D2CodingBold", "", os.path.join(os.path.dirname(__file__), "..", "fonts", "D2CodingBold.ttf"))
+        pdf.add_font("D2Coding", "", os.path.join(os.path.dirname(__file__), "..", "fonts", "D2Coding.ttf"))
+    except FileNotFoundError:
+        USE_D2 = False
+    FONT_BOLD = "D2CodingBold" if USE_D2 else "helvetica"
+    FONT_REG = "D2Coding" if USE_D2 else "helvetica"
     # --- [헤더: 리포트 제목] ---
-    pdf.set_font("D2CodingBold", size=18)
+    pdf.set_font(FONT_BOLD, size=18)
     pdf.cell(0, 15, "FindAndFixMe - 상세 분석 리포트", ln=True, align='C')
     pdf.ln(5)
 
@@ -86,7 +100,7 @@ def create_pdf_report(record):
     pdf.ellipse(180, 10, 15, 15, 'F') 
 
     # 원형 박스 안에 들어갈 텍스트 설정
-    pdf.set_font("D2CodingBold", size=12) # 원형 안에 쏙 들어가도록 폰트 크기 미세 조정
+    pdf.set_font(FONT_BOLD, size=12) # 원형 안에 쏙 들어가도록 폰트 크기 미세 조정
     pdf.set_text_color(255, 255, 255) # 글자색: 하얀색
     
     # 텍스트 셀의 크기와 위치를 원형과 정확히 일치시켜 정중앙에 글자가 오도록 합니다
@@ -99,7 +113,7 @@ def create_pdf_report(record):
     
     # --- [섹션 1: 메타데이터 요약 (회색 배경 박스)] ---
     pdf.set_fill_color(245, 245, 245) # 연한 회색 지정
-    pdf.set_font("D2Coding", size=11)
+    pdf.set_font(FONT_REG, size=11)
 
     ts = record.get('timestamp', '기록 없음')
     file_name = record.get('file', 'Unknown')
@@ -134,10 +148,10 @@ def create_pdf_report(record):
     pdf.ln(5)
     
     # --- [섹션 2: Gemini 정성 평가] ---
-    pdf.set_font("D2Coding", size=13)
+    pdf.set_font(FONT_REG, size=13)
     pdf.cell(0, 10, f"🤖 AI 정성 평가 결과 (Score: {llm_score})", ln=True)
     
-    pdf.set_font("D2Coding", size=11)
+    pdf.set_font(FONT_REG, size=11)
     # multi_cell로 긴 평가 사유를 줄바꿈하여 출력합니다.
     pdf.multi_cell(0, 8, f"평가 사유: {llm_reasoning}")
     pdf.ln(5)
@@ -147,7 +161,7 @@ def create_pdf_report(record):
     pdf.ln(5)
 
     # --- [섹션 3: 기술 상세 정보 (Z3 & Diff)] ---
-    pdf.set_font("D2Coding", size=13)
+    pdf.set_font(FONT_REG, size=13)
     pdf.cell(0, 10, "🎯 Z3 SMT Solver Trigger Conditions & Inputs", ln=True)
     
     constraints_list = record.get('constraints', [])
@@ -157,15 +171,15 @@ def create_pdf_report(record):
             expr_str = c_item.get('constraint_expr', 'N/A')
             inp_str = c_item.get('trigger_input', 'N/A')
             
-            pdf.set_font("D2CodingBold", size=10)
+            pdf.set_font(FONT_BOLD, size=10)
             pdf.cell(0, 6, f" Location: {loc_str}", ln=True)
-            pdf.set_font("D2Coding", size=9)
+            pdf.set_font(FONT_REG, size=9)
             pdf.multi_cell(0, 5, f"Constraint: {expr_str}")
             pdf.ln(2)
             pdf.multi_cell(0, 5, f"Trigger Input: {inp_str}")
             pdf.ln(4)
     else:
-        pdf.set_font("D2Coding", size=10)
+        pdf.set_font(FONT_REG, size=10)
         pdf.multi_cell(0, 6, f"Constraint: {z3_cond}")
         pdf.ln(2)
         pdf.multi_cell(0, 6, f"Trigger Input: {record.get('trigger_input', 'N/A')}")
@@ -175,13 +189,13 @@ def create_pdf_report(record):
     pdf.ln(5)
 
     # --- [섹션 4: Code Diff (Hunk 배너 가공 버전)] ---
-    pdf.set_font("D2Coding", size=13)
+    pdf.set_font(FONT_REG, size=13)
     pdf.set_x(10)
     pdf.cell(pdf.epw, 10, "💻 Code Diff (Unified)")
     pdf.ln(8)
     
     # 소스코드용 폰트 크기 설정
-    pdf.set_font("D2Coding", size=8.5)
+    pdf.set_font(FONT_REG, size=8.5)
     
     hunk_patterns = {}
     current_hunk_line = None
@@ -306,7 +320,7 @@ def create_pdf_report(record):
                 pdf.set_x(10)
                 pdf.set_fill_color(243, 235, 250)
                 pdf.set_text_color(111, 66, 193)
-                pdf.set_font("D2CodingBold", size=9)
+                pdf.set_font(FONT_BOLD, size=9)
                 pdf.cell(pdf.epw, 6, hunk_banner, ln=True, fill=True, align='C')
                 pdf.ln(3)
             else:
@@ -314,11 +328,11 @@ def create_pdf_report(record):
                 pdf.set_x(10)
                 pdf.set_fill_color(243, 235, 250)
                 pdf.set_text_color(111, 66, 193)
-                pdf.set_font("D2CodingBold", size=9)
+                pdf.set_font(FONT_BOLD, size=9)
                 pdf.cell(pdf.epw, 6, hunk_banner, ln=True, fill=True, align='C')
                 pdf.ln(3)
                 
-            pdf.set_font("D2Coding", size=8.5)
+            pdf.set_font(FONT_REG, size=8.5)
             
         elif clean_line.startswith('---') or clean_line.startswith('+++'):
             # original, mutated 파일 헤더 텍스트는 리포트 가독성을 위해 과감히 생략합니다.
@@ -373,6 +387,11 @@ def main() -> None:
             format_func=lambda x: pattern_options[x],
             index=0
         )
+        fuzz_seconds = st.number_input(
+            "Fuzzing time (seconds)",
+            min_value=5, max_value=3600, value=60, step=5,
+            help="AFL++ 퍼징 실행 시간. 길수록 희귀 경로 발견율이 올라가지만 파이프라인이 길어집니다."
+        )
         
         # 상태 초기화
         if "analysis_result" not in st.session_state:
@@ -387,6 +406,7 @@ def main() -> None:
                 if st.button("Run Full Pipeline", type="primary"):
                     st.session_state["analysis_result"] = None # 이전 결과 초기화
                     st.session_state["validation_results"] = {}
+                    st.session_state["injected_nodes"] = set()
                     try:
                         with st.status("Running FindAndFixMe Pipeline...", expanded=True) as status:
                             st.write("Uploading files to server...")
@@ -394,7 +414,7 @@ def main() -> None:
                             res_upload = upload_targets(files_list)
                             prog_id = res_upload["program_id"]
                             
-                            _run_pipeline_ui(prog_id, status, pattern_options, selected_pattern_id)
+                            _run_pipeline_ui(prog_id, status, pattern_options, selected_pattern_id, int(fuzz_seconds))
                     except requests.exceptions.HTTPError as e:
                         err_msg = e.response.json().get("detail", str(e)) if e.response else str(e)
                         status.update(label="Pipeline Failed", state="error", expanded=True)
@@ -411,6 +431,7 @@ def main() -> None:
                 if st.button("Import and Run Pipeline", type="primary"):
                     st.session_state["analysis_result"] = None # 이전 결과 초기화
                     st.session_state["validation_results"] = {}
+                    st.session_state["injected_nodes"] = set()
                     try:
                         with st.status("Running FindAndFixMe Github Pipeline...", expanded=True) as status:
                             st.write("Cloning repo and compiling dependencies in background...")
@@ -420,7 +441,7 @@ def main() -> None:
                             # Wait for the background compilation to finish successfully
                             wait_for_github_import(prog_id)
                             
-                            _run_pipeline_ui(prog_id, status, pattern_options, selected_pattern_id)
+                            _run_pipeline_ui(prog_id, status, pattern_options, selected_pattern_id, int(fuzz_seconds))
                     except requests.exceptions.HTTPError as e:
                         err_msg = e.response.json().get("detail", str(e)) if e.response else str(e)
                         status.update(label="Github Pipeline Failed", state="error", expanded=True)
@@ -453,6 +474,35 @@ def main() -> None:
                     st.markdown(f"#### Mutation {idx+1}: {mut.get('pattern_name', 'Unknown Pattern')}")
                     render_diff_viewer(mut.get('original_code', ''), mut.get('mutated_code', ''))
             
+            st.markdown("---")
+            st.markdown("### 2b. Campaign: Inject All Remaining Corners")
+            st.caption("미주입 코너마다 뮤턴트 1개씩 생성합니다. 노드 수 × 수 분 걸릴 수 있어 백그라운드로 돌려두세요. 단일 패턴 선택 시 훨씬 빠릅니다.")
+            if st.button("Inject All Remaining Corners", help="Create one mutant per not-yet-injected corner node"):
+                done = st.session_state.setdefault("injected_nodes", set())
+                remaining = [c["id"] for c in cc_data if c["id"] not in done]
+                if not remaining:
+                    st.info("주입할 남은 코너가 없습니다.")
+                else:
+                    bar = st.progress(0)
+                    ok = 0
+                    for i, nid in enumerate(remaining):
+                        try:
+                            r = inject_mutation(nid, selected_pattern_id, wait=True)
+                            st.session_state["analysis_result"]["data"]["mutations"].append({
+                                "pattern_name": r.get("pattern_name"),
+                                "original_code": r.get("original_code"),
+                                "mutated_code": r.get("mutated_code"),
+                                "mutant_id": r.get("mutant_id"),
+                                "trigger_input": ""
+                            })
+                            done.add(nid)
+                            ok += 1
+                        except Exception as e:
+                            st.warning(f"Corner {nid} 주입 실패: {e}")
+                        bar.progress((i + 1) / len(remaining))
+                    st.success(f"{ok}/{len(remaining)}개 코너 주입 완료!")
+                    st.rerun()
+
             st.markdown("---")
             st.markdown("### 3. Verification Tools")
             col_afl, col_gemini = st.columns(2)
@@ -522,6 +572,8 @@ def main() -> None:
                             
                             if 'survival_rate' in res:
                                 st.warning(f"🛡️ **AFL++ Survival Rate:** {res['survival_rate']:.1f}%")
+                                if res.get('output_divergence_rate') is not None:
+                                    st.caption(f"📤 Output-only divergence: {res['output_divergence_rate']:.1f}% (same exit code, different stdout)")
                                 
                             if 'llm_score' in res:
                                 st.success(f"🤖 **Gemini AI Score:** {res['llm_score']}")

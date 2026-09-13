@@ -43,6 +43,9 @@ db = TraceDBManager(DB_PATH)
 # [수정] 상대 경로로 인한 os.getcwd() FileNotFoundError 방지를 위해 BASE_DIR 기준 절대경로 강제
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
+BACKEND_REV = "20260906-gatesweep-backfill"
+print(f"[Boot] FindAndFixMe API rev={BACKEND_REV} BASE_DIR={BASE_DIR}")
+
 MUTATION_ENGINE_BIN = os.environ.get(
     "MUTATION_ENGINE_BIN",
     os.path.join(BASE_DIR, "core", "build", "MutationEngine")
@@ -97,6 +100,98 @@ def _find_library_dirs(build_dir_host: str) -> list[str]:
                 lib_dirs.add(root)
                 break
     return list(lib_dirs)
+
+
+def _host_to_docker_mount(host_dir: str) -> str:
+    """[T2] DooD-safe host path resolution for Docker -v mounts.
+
+    Tries trace_parser._get_host_absolute_path (Docker-out-of-Docker aware)
+    and falls back to os.path.abspath when unavailable.
+    """
+    if not host_dir:
+        return host_dir
+    # 호스트에서 직접 실행 중이면(네이티브 Windows/WSL/Linux) abspath가 이미
+    # 유효한 호스트 경로이므로 그대로 쓴다. 컨테이너 내부(DooD)일 때만 변환한다.
+    try:
+        if not os.path.exists("/.dockerenv"):
+            return os.path.abspath(host_dir)
+    except Exception:
+        pass
+    try:
+        from .data.trace_parser import _get_host_absolute_path as _resolve
+        return _resolve(host_dir)
+    except Exception as e:
+        print(f"[_host_to_docker_mount] fallback to abspath for {host_dir}: {e}")
+        try:
+            return os.path.abspath(host_dir)
+        except Exception as e2:
+            print(f"[_host_to_docker_mount] abspath failed: {e2}")
+            return host_dir
+
+
+def _collect_sources_and_flags(source_path: str):
+    """[T2] Shared source/flag collection for _compile_regular and _compile_afl.
+
+    Returns (all_sources_host, container_sources, extra_flags, include_flags, linker_paths).
+    Only the compiler binary differs between callers; instrument.cpp copy and
+    -finstrument-* flags stay in the regular path.
+    """
+    prog_dir_host = os.path.dirname(os.path.abspath(source_path))
+    other_sources = []
+    for f in os.listdir(prog_dir_host):
+        if f.endswith((".cpp", ".cc", ".cxx")):
+            if f.endswith("_mutant.cpp"):  # 뮤턴트 소스코드 컴파일 빌드 제외 (CWE 주입용)
+                continue
+            full_p = os.path.join(prog_dir_host, f)
+            if full_p == os.path.abspath(source_path):
+                continue
+            try:
+                with open(full_p, "r", encoding="utf-8") as src_f:
+                    if "main(" not in src_f.read():
+                        other_sources.append(full_p)
+            except Exception as e:
+                print(f"[_collect_sources_and_flags] skip {full_p}: {e}")
+                continue
+
+    all_sources_host = [os.path.abspath(source_path)] + other_sources
+    container_sources = ["/target/" + os.path.basename(p) for p in all_sources_host]
+
+    extra_flags: list = []
+    for src in all_sources_host:
+        try:
+            with open(src, "r", encoding="utf-8") as ff:
+                if "LLVMFuzzerTestOneInput" in ff.read():
+                    extra_flags.append("-fsanitize=fuzzer")
+                    break
+        except Exception as e:
+            print(f"[_collect_sources_and_flags] flag scan skip {src}: {e}")
+            continue
+
+    flags_file = os.path.join(prog_dir_host, "compile_flags.txt")
+    if os.path.exists(flags_file):
+        try:
+            with open(flags_file, "r", encoding="utf-8") as ff:
+                for line in ff:
+                    flag = line.strip()
+                    if flag and not flag.startswith("#"):
+                        extra_flags.append(flag)
+        except Exception as e:
+            print(f"[_collect_sources_and_flags] compile_flags.txt read failed: {e}")
+
+    include_flags = ["-I/target", "-I/target/.."]
+    linker_paths: list = []
+    repo_path_host = os.path.join(prog_dir_host, "repo")
+    if os.path.exists(repo_path_host):
+        include_flags.append("-I/target/repo")
+        # [자동화 일반화] 빌드된 모든 라이브러리 디렉토리를 동적으로 추적하여 링커 경로에 추가
+        build_path_host = os.path.join(repo_path_host, "build")
+        if os.path.exists(build_path_host):
+            for lib_dir_host in _find_library_dirs(build_path_host):
+                rel_path = os.path.relpath(lib_dir_host, repo_path_host)
+                container_lib_dir = os.path.join("/target/repo", rel_path).replace("\\", "/")
+                linker_paths.extend([f"-L{container_lib_dir}", f"-Wl,-rpath,{container_lib_dir}"])
+
+    return all_sources_host, container_sources, extra_flags, include_flags, linker_paths
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,7 +275,7 @@ def _run_cmd_in_docker(cmd: list, mounts: dict, env: dict = None, timeout: int =
 # ─────────────────────────────────────────────────────────────────────────────
 def _compile_regular(source_path: str, binary_path: str) -> str:
     prog_dir_host = os.path.dirname(os.path.abspath(source_path))
-    mounts = {prog_dir_host: "/target"}
+    mounts = {_host_to_docker_mount(prog_dir_host): "/target"}
 
     # instrument.cpp 복사하여 빌드에 참여시킴
     inst_src = os.path.join(BASE_DIR, "backend", "data", "instrument.cpp")
@@ -188,23 +283,9 @@ def _compile_regular(source_path: str, binary_path: str) -> str:
     if os.path.exists(inst_src):
         shutil.copy(inst_src, inst_dest)
 
-    other_sources = []
-    for f in os.listdir(prog_dir_host):
-        if f.endswith((".cpp", ".cc", ".cxx")):
-            if f.endswith("_mutant.cpp"):  # 뮤턴트 소스코드 컴파일 빌드 제외 (CWE 주입용)
-                continue
-            full_p = os.path.join(prog_dir_host, f)
-            if full_p == os.path.abspath(source_path): continue
-            try:
-                with open(full_p, "r", encoding="utf-8") as src_f:
-                    if "main(" not in src_f.read():
-                        other_sources.append(full_p)
-            except: pass
-
-    all_sources_host = [os.path.abspath(source_path)] + other_sources
-    container_sources = ["/target/" + os.path.basename(p) for p in all_sources_host]
+    all_sources_host, container_sources, extra_flags, include_flags, linker_paths = _collect_sources_and_flags(source_path)
     container_binary = "/target/" + os.path.basename(binary_path)
-    
+
     # 함수 추적을 위한 컴파일러/링커 플래그 추가 (-finstrument-functions-after-inlining, -fno-pic, -fno-PIE, -no-pie, -rdynamic, -ldl)
     extra_flags = [
         "-finstrument-functions-after-inlining",
@@ -215,36 +296,8 @@ def _compile_regular(source_path: str, binary_path: str) -> str:
         "-ldl",
         "-Wno-format-security",
         "-pthread"
-    ]
-    for src in all_sources_host:
-        try:
-            with open(src, "r", encoding="utf-8") as f:
-                if "LLVMFuzzerTestOneInput" in f.read():
-                    extra_flags.append("-fsanitize=fuzzer")
-                    break
-        except: pass
+    ] + extra_flags
 
-    flags_file = os.path.join(prog_dir_host, "compile_flags.txt")
-    if os.path.exists(flags_file):
-        with open(flags_file, "r", encoding="utf-8") as f:
-            for line in f:
-                flag = line.strip()
-                if flag and not flag.startswith("#"):
-                    extra_flags.append(flag)
-
-    include_flags = ["-I/target", "-I/target/.."]
-    linker_paths = []
-    repo_path_host = os.path.join(prog_dir_host, "repo")
-    if os.path.exists(repo_path_host):
-        include_flags.append("-I/target/repo")
-        # [자동화 일반화] 빌드된 모든 라이브러리 디렉토리를 동적으로 추적하여 링커 경로에 추가
-        build_path_host = os.path.join(repo_path_host, "build")
-        if os.path.exists(build_path_host):
-            for lib_dir_host in _find_library_dirs(build_path_host):
-                rel_path = os.path.relpath(lib_dir_host, repo_path_host)
-                container_lib_dir = os.path.join("/target/repo", rel_path).replace("\\", "/")
-                linker_paths.extend([f"-L{container_lib_dir}", f"-Wl,-rpath,{container_lib_dir}"])
- 
     cmd = ["clang++", "-std=c++17"] + include_flags + linker_paths + ["-o", container_binary] + extra_flags + container_sources
     result = _run_cmd_in_docker(cmd, mounts=mounts, timeout=300)
     err_str = result.stderr.decode('utf-8', errors='ignore') if isinstance(result.stderr, bytes) else str(result.stderr)
@@ -253,55 +306,11 @@ def _compile_regular(source_path: str, binary_path: str) -> str:
 
 def _compile_afl(source_path: str, afl_binary_path: str) -> str:
     prog_dir_host = os.path.dirname(os.path.abspath(source_path))
-    mounts = {prog_dir_host: "/target"}
+    mounts = {_host_to_docker_mount(prog_dir_host): "/target"}
 
-    other_sources = []
-    for f in os.listdir(prog_dir_host):
-        if f.endswith((".cpp", ".cc", ".cxx")):
-            if f.endswith("_mutant.cpp"):  # 뮤턴트 컴파일 제외
-                continue
-            full_p = os.path.join(prog_dir_host, f)
-            if full_p == os.path.abspath(source_path): continue
-            try:
-                with open(full_p, "r", encoding="utf-8") as src_f:
-                    if "main(" not in src_f.read():
-                        other_sources.append(full_p)
-            except: pass
-
-    all_sources_host = [os.path.abspath(source_path)] + other_sources
-    container_sources = ["/target/" + os.path.basename(p) for p in all_sources_host]
+    all_sources_host, container_sources, extra_flags, include_flags, linker_paths = _collect_sources_and_flags(source_path)
     container_binary = "/target/" + os.path.basename(afl_binary_path)
 
-    extra_flags = []
-    for src in all_sources_host:
-        try:
-            with open(src, "r", encoding="utf-8") as f:
-                if "LLVMFuzzerTestOneInput" in f.read():
-                    extra_flags.append("-fsanitize=fuzzer")
-                    break
-        except: pass
-
-    flags_file = os.path.join(prog_dir_host, "compile_flags.txt")
-    if os.path.exists(flags_file):
-        with open(flags_file, "r", encoding="utf-8") as f:
-            for line in f:
-                flag = line.strip()
-                if flag and not flag.startswith("#"):
-                    extra_flags.append(flag)
-
-    include_flags = ["-I/target", "-I/target/.."]
-    linker_paths = []
-    repo_path_host = os.path.join(prog_dir_host, "repo")
-    if os.path.exists(repo_path_host):
-        include_flags.append("-I/target/repo")
-        # [자동화 일반화] 빌드된 모든 라이브러리 디렉토리를 동적으로 추적하여 링커 경로에 추가
-        build_path_host = os.path.join(repo_path_host, "build")
-        if os.path.exists(build_path_host):
-            for lib_dir_host in _find_library_dirs(build_path_host):
-                rel_path = os.path.relpath(lib_dir_host, repo_path_host)
-                container_lib_dir = os.path.join("/target/repo", rel_path).replace("\\", "/")
-                linker_paths.extend([f"-L{container_lib_dir}", f"-Wl,-rpath,{container_lib_dir}"])
- 
     cmd = ["afl-clang-fast++", "-std=c++17"] + include_flags + linker_paths + ["-o", container_binary] + extra_flags + container_sources
     result = _run_cmd_in_docker(cmd, mounts=mounts, timeout=300)
     err_str = result.stderr.decode('utf-8', errors='ignore') if isinstance(result.stderr, bytes) else str(result.stderr)
@@ -337,10 +346,12 @@ def _run_afl_docker(program_id: int, afl_binary_path: str, afl_out_dir: str, tim
             with open(os.path.join(seed_dir_host, "seed0"), "wb") as f:
                 f.write(b"\x00" * 8)
 
+    _ensure_test_target_gate_seeds(seed_dir_host, binary_path_host, program_id)
+
     mounts = {
-        prog_dir_host: "/target",
-        afl_out_dir_host: "/out",
-        seed_dir_host: "/seeds"
+        _host_to_docker_mount(prog_dir_host): "/target",
+        _host_to_docker_mount(afl_out_dir_host): "/out",
+        _host_to_docker_mount(seed_dir_host): "/seeds"
     }
 
     afl_env = {
@@ -429,6 +440,69 @@ async def get_target_program(program_id: int):
     }
 
 
+_SEED_FILE_EXTS = frozenset([".txt", ".csv", ".dat", ".bin", ".in", ".json", ".xml"])
+_SEED_NAME_HINTS = ("test", "data", "example", "sample", "input", "seed", "corpus")
+
+def _harvest_repo_seeds(repo_dir: str, program_id: int,
+                        max_files: int = 20, max_bytes: int = 100 * 1024) -> int:
+    """clone된 repo에서 퍼저 시드로 쓸 만한 파일을 수확한다(.git 제외)."""
+    try:
+        seed_dir = os.path.join(AFL_OUTPUT_BASE, f"seeds_{program_id}")
+        os.makedirs(seed_dir, exist_ok=True)
+        collected = 0
+        for root, dirs, files in os.walk(repo_dir):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            for fn in sorted(files):
+                if collected >= max_files:
+                    break
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in _SEED_FILE_EXTS and not any(
+                        h in fn.lower() for h in _SEED_NAME_HINTS):
+                    continue
+                fp = os.path.join(root, fn)
+                try:
+                    if os.path.getsize(fp) == 0 or os.path.getsize(fp) > max_bytes:
+                        continue
+                    with open(fp, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    continue
+                with open(os.path.join(seed_dir, f"repo_{collected:04d}_{fn[:40]}"), "wb") as out:
+                    out.write(data)
+                collected += 1
+            if collected >= max_files:
+                break
+        print(f"[Seed Harvest] program {program_id}: {collected} repo files as fuzz seeds")
+        return collected
+    except Exception as e:
+        print(f"[Seed Harvest] failed: {e}")
+        return 0
+
+
+def _ensure_test_target_gate_seeds(seed_dir_host: str, binary_path_host: str,
+                                     program_id: int) -> int:
+    """test_target 게이트 시드가 하나라도 빠졌으면 이름 기준으로 보충한다."""
+    try:
+        if "test_target" not in os.path.basename(binary_path_host).lower():
+            return 0
+        wanted = {f"seed_gate_{k:02d}": bytes([100, 1, k, 42, 0, 0, 0, 0])
+                  for k in range(0, 11)}
+        wanted["seed_crash_sigfpe"] = bytes([100, 0, 0, 0, 0, 0, 0, 0])
+        wrote = 0
+        for name, data in wanted.items():
+            fp = os.path.join(seed_dir_host, name)
+            if not os.path.exists(fp):
+                with open(fp, "wb") as f:
+                    f.write(data)
+                wrote += 1
+        if wrote:
+            print(f"[Seed Sweep] program {program_id}: {wrote} test_target gate seeds written")
+        return wrote
+    except Exception as e:
+        print(f"[Seed Sweep] backfill failed: {e}")
+        return 0
+
+
 def _bg_init_target_github(program_id: int, req: GithubTargetRequest):
     try:
         repo_name_raw = req.repo_url.rstrip("/").split("/")[-1].replace(".git", "")
@@ -453,6 +527,8 @@ def _bg_init_target_github(program_id: int, req: GithubTargetRequest):
         except subprocess.TimeoutExpired:
             raise Exception("Git Clone timed out after 300 seconds.")
 
+        _harvest_repo_seeds(repo_dir, program_id)
+
         # [자동화] 동적 apt 패키지 설치 처리 (분석할 오픈소스 맞춤 디펜던시)
         if req.apt_packages:
             print(f"[Docker Sandbox] Dynamically installing developer packages: {req.apt_packages}...")
@@ -463,7 +539,7 @@ def _bg_init_target_github(program_id: int, req: GithubTargetRequest):
         os.makedirs(build_dir, exist_ok=True)
 
         print(f"[CMake] Configuring {req.repo_url} in Docker Sandbox for compilation flags extraction...")
-        cmake_mounts = {os.path.abspath(repo_dir): "/repo"}
+        cmake_mounts = {_host_to_docker_mount(os.path.abspath(repo_dir)): "/repo"}
         try:
             cmake_res = _run_cmd_in_docker(
                 ["cmake", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", ".."],
@@ -601,6 +677,7 @@ async def compile_target(program_id: int, background_tasks: BackgroundTasks):
 async def collect_traces(program_id: int, background_tasks: BackgroundTasks, fuzz_seconds: int = 60):
     program = db.get_program(program_id)
     if not program: raise HTTPException(status_code=404, detail="Program not found.")
+    fuzz_seconds = max(5, min(fuzz_seconds, 3600))
 
     task_id = f"trace_{program_id}_{int(time.time())}"
     TASK_STATUS[task_id] = {"status": "processing", "progress": 0}
@@ -700,17 +777,34 @@ async def solve_smt(req: SMTSolveRequest):
         if exec_path_json:
             try:
                 exec_path = json.loads(exec_path_json)
-            except:
-                pass
+            except Exception as e:
+                print(f"[SMT] execution_path JSON parse failed: {e}")
+                exec_path = []
 
         # 2. Map path / code location to Z3 SMT conditions
         conditions = None
-        
+
         # Check execution path first (as it contains full function trace)
         path_str = " -> ".join(exec_path) if exec_path else ""
-        
+
+        # [T2] Generic path first: extract buf_N <op> const tokens via regex
+        # so generic targets work, not just test_target.cpp layouts.
+        try:
+            generic_conds = []
+            _smt_pat = re.compile(r"buf_\d+\s*(==|!=|<=|>=|<|>)\s*\d+")
+            for _elem in (exec_path if isinstance(exec_path, list) else []):
+                for _tok in _smt_pat.finditer(str(_elem)):
+                    _c = _tok.group(0).strip()
+                    if _c not in generic_conds:
+                        generic_conds.append(_c)
+            if generic_conds:
+                conditions = generic_conds
+        except Exception as e:
+            print(f"[SMT] generic regex extraction failed: {e}")
+
+        # Fallback: existing test_target.cpp string-matching map
         # Check execution path or code location for specific conditions
-        if "CRASH(SIGFPE)" in path_str or "CRASH(SIGFPE)" in code_loc:
+        if conditions is None and ("CRASH(SIGFPE)" in path_str or "CRASH(SIGFPE)" in code_loc):
             conditions = ["buf_1 == 0"]
         elif "common_processing" in path_str or "common_processing" in code_loc:
             conditions = ["buf_0 <= 199", "buf_1 != 0"]
@@ -726,8 +820,15 @@ async def solve_smt(req: SMTSolveRequest):
 
         # 3. Solve path constraints if mapped
         is_solved = 0
-        trigger_input = "분석 불가"
-        constraint_expr = json.dumps(conditions) if conditions else "unknown_path"
+        # [T2] Never return bare "분석 불가" without storing attempted path.
+        _attempted_tail = exec_path[-3:] if isinstance(exec_path, list) and exec_path else ([path_str] if path_str else [])
+        trigger_input = f"분석 불가: {json.dumps(_attempted_tail, ensure_ascii=False)}"
+        if conditions:
+            constraint_expr = json.dumps(conditions)
+        elif _attempted_tail:
+            constraint_expr = json.dumps(_attempted_tail, ensure_ascii=False)
+        else:
+            constraint_expr = json.dumps({"code_location": code_loc}, ensure_ascii=False)
         
         if conditions:
             solver = SMTSolver(timeout_sec=3.0)
@@ -741,8 +842,9 @@ async def solve_smt(req: SMTSolveRequest):
                             idx = int(k.split("_")[1])
                             if 0 <= idx < 8:
                                 buf[idx] = int(v)
-                        except:
-                            pass
+                        except Exception as e:
+                            print(f"[SMT] buf index parse skip {k}={v}: {e}")
+                            continue
                 trigger_input = str(buf)
                 is_solved = 1
 
@@ -848,10 +950,85 @@ def normalize_project_relative_path(path_str: str, base_dir: str) -> str:
         return os.path.basename(path_str)
 
 
+_WRAPPER_FUNC_NAMES = frozenset([
+    "LLVMFuzzerTestOneInput", "FuzzedDataProvider", "static_analysis", "Main",
+])
+
+def _clean_func_token(tok: str) -> str:
+    name = tok.split(" (")[0] if " (" in tok else tok.split("(")[0]
+    name = name.split("::")[-1].strip()
+    return name
+
+def _derive_target_func_list(execution_path, code_location: str) -> list:
+    """실행 경로의 함수들을 최심부부터 순서대로 반환한다(중복 제거)."""
+    cands = []
+    if isinstance(execution_path, list):
+        cands = execution_path
+    elif isinstance(execution_path, str) and execution_path:
+        try:
+            loaded = json.loads(execution_path)
+            if isinstance(loaded, list):
+                cands = loaded
+        except Exception:
+            cands = []
+    if not cands and code_location:
+        m = re.search(r'_depth\d+_(.+)$', code_location)
+        if m:
+            cands = [m.group(1)]
+    ordered: list = []
+    for tok in reversed(cands or []):
+        if not isinstance(tok, str):
+            continue
+        if tok.startswith(("CRASH(", "EXIT(", "common_path_edges=",
+                            "rare_edges=", "total_cov=")):
+            continue
+        name = _clean_func_token(tok)
+        if not name or name in _WRAPPER_FUNC_NAMES:
+            continue
+        if not re.match(r'^[~A-Za-z_][\w]*$', name):
+            continue
+        if name not in ordered:
+            ordered.append(name)
+    return ordered
+
+def _derive_target_func(execution_path, code_location: str) -> str:
+    lst = _derive_target_func_list(execution_path, code_location)
+    return lst[0] if lst else ""
+
+def _probe_func_patterns(engine_bin: str, source_path: str, target_func: str,
+                         compile_args: list, mounts: dict) -> Optional[set]:
+    """해당 함수에 매칭되는 패턴 ID 집합을 1회 실행으로 조사한다. 실패 시 None."""
+    try:
+        cmd = [engine_bin, source_path, "--pattern-id=0"]
+        if target_func:
+            cmd.append(f"--target-func={target_func}")
+        cmd.extend(["--"] + compile_args)
+        res = _run_cmd_in_docker(cmd, mounts=mounts, network="bridge", timeout=90)
+        stdout_str = res.stdout.decode('utf-8', errors='ignore') if isinstance(res.stdout, bytes) else str(res.stdout)
+        if res.returncode != 0:
+            return None
+        try:
+            output = json.loads(stdout_str)
+        except json.JSONDecodeError:
+            return None
+        matched = set()
+        for m in output.get("mutations", []):
+            try:
+                pid = int(m.get("pattern_id", -1))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if pid in PATTERN_REGISTRY:
+                matched.add(pid)
+        return matched
+    except Exception as e:
+        print(f"[Probe Warning] {e}")
+        return None
+
+
 def _perform_injection(req: MutationInjectRequest):
     actual_node_id: Optional[int] = None
     row = None
-    target_func = ""
+    target_func_candidates: list = []
     try:
         with get_db_connection() as conn:
             row = conn.execute(
@@ -861,8 +1038,22 @@ def _perform_injection(req: MutationInjectRequest):
                    JOIN CornerCaseNode c ON c.trace_id = d.id
                    WHERE c.id = ?""", (req.node_id,)
             ).fetchone()
-        if row: 
+        if row:
             actual_node_id = req.node_id
+            try:
+                with get_db_connection() as conn:
+                    nrow = conn.execute(
+                        """SELECT c.node_type, c.code_location, d.execution_path
+                           FROM CornerCaseNode c JOIN DynamicTrace d ON c.trace_id = d.id
+                           WHERE c.id = ?""", (req.node_id,)).fetchone()
+                if nrow:
+                    cloc = nrow["code_location"] or ""
+                    target_func_candidates = _derive_target_func_list(
+                        nrow["execution_path"], cloc)
+                    if target_func_candidates:
+                        print(f"[Injection Scope] candidates (deepest-first): {target_func_candidates}")
+            except Exception as e:
+                print(f"[Injection Scope] derive failed, file-wide fallback: {e}")
     except Exception as e:
         print(f"[Mutation Error] Failed to query program via CornerCaseNode: {e}")
         pass
@@ -922,7 +1113,7 @@ def _perform_injection(req: MutationInjectRequest):
         else:
             container_compile_args.append(arg.replace("\\", "/"))
 
-    mounts = { os.path.abspath(BASE_DIR): "/app" }
+    mounts = { _host_to_docker_mount(os.path.abspath(BASE_DIR)): "/app" }
 
     # [핵심 변경] Auto Detect(pattern_id=0)일 때 모든 매칭 패턴을 순차 적용
     # 각 패턴의 출력이 다음 패턴의 입력이 되어 CWE-190 + CWE-193이 동시에 주입됩니다
@@ -931,56 +1122,84 @@ def _perform_injection(req: MutationInjectRequest):
     working_code = original_code  # 현재 작업 중인 코드 (패턴마다 갱신)
     host_source_path_resolved = os.path.abspath(os.path.join(BASE_DIR, rel_source))
 
-    for pid in patterns:
-        try:
-            cmd = [container_engine_bin, container_source_path, f"--pattern-id={pid}"]
-            if target_func:
-                cmd.append(f"--target-func={target_func}")
-            cmd.extend(["--"] + container_compile_args)
-            print(f"[Mutation Trace] Executing MutationEngine inside Sandbox: {' '.join(cmd)}")
-            res = _run_cmd_in_docker(cmd, mounts=mounts, network="bridge", timeout=90)
-            
-            stdout_str = res.stdout.decode('utf-8', errors='ignore') if isinstance(res.stdout, bytes) else str(res.stdout)
-            stderr_str = res.stderr.decode('utf-8', errors='ignore') if isinstance(res.stderr, bytes) else str(res.stderr)
-            
-            if res.returncode != 0:
-                print(f"[Mutation Warning] MutationEngine exited with code {res.returncode}.\nStderr: {stderr_str}\nStdout: {stdout_str}")
-                last_error_detail = f"ExitCode: {res.returncode}\nStderr: {stderr_str[:500]}"
-                continue
-                
+    _tried_funcs: list = []
+    for target_func in (target_func_candidates or [""]):
+        _tried_funcs.append(target_func or "(file-wide)")
+        if target_func_candidates:
+            print(f"[Injection Scope] trying func: {target_func or '(file-wide)'}")
+        chain_pids = patterns
+        if req.pattern_id == 0:
+            probed = _probe_func_patterns(container_engine_bin, container_source_path,
+                                          target_func, container_compile_args, mounts)
+            if probed is not None:
+                if not probed:
+                    print(f"[Injection Scope] no match in func: {target_func or '(file-wide)'} (skipped)")
+                    continue
+                chain_pids = [p for p in patterns if p in probed]
+        for pid in chain_pids:
             try:
-                output = json.loads(stdout_str)
-            except json.JSONDecodeError as je:
-                print(f"[Mutation Error] Failed to parse JSON. Stdout was:\n{stdout_str}\nError: {je}")
-                last_error_detail = f"JSON Parse Error. Stdout: {stdout_str[:300]}"
-                continue
-                
-            m_code, m_list = output.get("mutated_code", ""), output.get("mutations", [])
-            if m_code and m_code.strip() != working_code.strip():
-                all_successful_patterns.append(pid)
-                all_mutations.extend(m_list)
-                working_code = m_code
-                # 다음 패턴이 이 결과 위에서 작업하도록 소스 파일 갱신
-                if os.path.exists(host_source_path_resolved):
-                    with open(host_source_path_resolved, "w", encoding="utf-8") as f:
-                        f.write(working_code)
-                print(f"[Mutation Success] Pattern {pid} ({PATTERN_REGISTRY.get(pid, '?')}) applied! Total mutations so far: {len(all_mutations)}")
-                # Auto Detect가 아니면 첫 성공에서 멈춤 (특정 패턴 지정 시)
-                if req.pattern_id != 0:
-                    break
-            else:
-                last_error_detail = "Generated code was identical to working code (No mutations matched)."
-        except Exception as e:
-            import traceback
-            tb_str = traceback.format_exc()
-            print(f"[Mutation Exception] Unexpected failure:\n{tb_str}")
-            last_error_detail = f"오류 유형: {type(e).__name__}\n상세 에러: {e}\n\n[파이썬 스택 트레이스]:\n{tb_str}"
-            continue
+                cmd = [container_engine_bin, container_source_path, f"--pattern-id={pid}"]
+                if target_func:
+                    cmd.append(f"--target-func={target_func}")
+                cmd.extend(["--"] + container_compile_args)
+                print(f"[Mutation Trace] Executing MutationEngine inside Sandbox: {' '.join(cmd)}")
+                res = _run_cmd_in_docker(cmd, mounts=mounts, network="bridge", timeout=90)
 
-    # 원본 소스 파일 복원 (체이닝 과정에서 덮어썼으므로)
+                stdout_str = res.stdout.decode('utf-8', errors='ignore') if isinstance(res.stdout, bytes) else str(res.stdout)
+                stderr_str = res.stderr.decode('utf-8', errors='ignore') if isinstance(res.stderr, bytes) else str(res.stderr)
+
+                if res.returncode != 0:
+                    print(f"[Mutation Warning] MutationEngine exited with code {res.returncode}.\nStderr: {stderr_str}\nStdout: {stdout_str}")
+                    last_error_detail = f"ExitCode: {res.returncode}\nStderr: {stderr_str[:500]}"
+                    continue
+
+                try:
+                    output = json.loads(stdout_str)
+                except json.JSONDecodeError as je:
+                    print(f"[Mutation Error] Failed to parse JSON. Stdout was:\n{stdout_str}\nError: {je}")
+                    last_error_detail = f"JSON Parse Error. Stdout: {stdout_str[:300]}"
+                    continue
+
+                m_code, m_list = output.get("mutated_code", ""), output.get("mutations", [])
+                if m_code and m_code.strip() != working_code.strip():
+                    all_successful_patterns.append(pid)
+                    all_mutations.extend(m_list)
+                    working_code = m_code
+                    # 엔진은 매번 파일을 읽으므로 다음 패턴이 이번 결과 위에서
+                    # 동작하도록 작업용 복사본(temp_targets)에만 쓴다. 원본 repo
+                    # 파일(host_source_file_path)은 절대 건드리지 않는다.
+                    if os.path.exists(host_source_path_resolved):
+                        with open(host_source_path_resolved, "w", encoding="utf-8") as f:
+                            f.write(working_code)
+                    print(f"[Mutation Success] Pattern {pid} ({PATTERN_REGISTRY.get(pid, '?')}) applied! Total mutations so far: {len(all_mutations)}")
+                    # Auto Detect가 아니면 첫 성공에서 멈춤 (특정 패턴 지정 시)
+                    if req.pattern_id != 0:
+                        break
+                else:
+                    last_error_detail = "Generated code was identical to working code (No mutations matched)."
+            except Exception as e:
+                import traceback
+                tb_str = traceback.format_exc()
+                print(f"[Mutation Exception] Unexpected failure:\n{tb_str}")
+                last_error_detail = f"오류 유형: {type(e).__name__}\n상세 에러: {e}\n\n[파이썬 스택 트레이스]:\n{tb_str}"
+                continue
+        if target_func and all_successful_patterns:
+            print(f"[Injection Scope] {len(all_successful_patterns)} pattern(s) so far after func: {target_func}")
+    if not all_successful_patterns and len(_tried_funcs) > 1:
+        last_error_detail = f"Tried funcs {_tried_funcs}: " + last_error_detail
+
+    # [US-06] Safety restore: chaining no longer overwrites the original file
+    # (working_code stays in-memory), so this only repairs external damage.
     if os.path.exists(host_source_path_resolved) and all_successful_patterns:
-        with open(host_source_path_resolved, "w", encoding="utf-8") as f:
-            f.write(original_code)
+        try:
+            with open(host_source_path_resolved, "r", encoding="utf-8") as f:
+                _current = f.read()
+        except Exception as e:
+            print(f"[US-06] safety-restore read failed: {e}")
+            _current = None
+        if _current is not None and _current.strip() != original_code.strip():
+            with open(host_source_path_resolved, "w", encoding="utf-8") as f:
+                f.write(original_code)
 
     if not all_successful_patterns:
         raise Exception(f"주입 가능한 취약점 패턴 미발견\n[에러 상세]:\n{last_error_detail}")
@@ -988,8 +1207,9 @@ def _perform_injection(req: MutationInjectRequest):
     successful_pattern = all_successful_patterns[0]
     mutated_code = working_code
     mutations = all_mutations
-    # 적용된 패턴들의 이름을 결합 (예: "CWE-190 Integer Overflow + CWE-193 Boundary Condition Error")
-    combined_pattern_name = " + ".join(PATTERN_REGISTRY.get(p, f"Pattern-{p}") for p in all_successful_patterns)
+    # 적용된 패턴들의 이름을 결합 (중복 제거, 순서 유지)
+    combined_pattern_name = " + ".join(
+        dict.fromkeys(PATTERN_REGISTRY.get(p, f"Pattern-{p}") for p in all_successful_patterns))
     req.pattern_id = all_successful_patterns[0]  # DB 저장용 (첫 번째 패턴 ID)
 
     mutant_binary_path = ""
@@ -999,9 +1219,10 @@ def _perform_injection(req: MutationInjectRequest):
 
     mutant_src = os.path.join(os.path.dirname(host_source_path), f"{os.path.splitext(os.path.basename(host_source_path))[0]}_mutant.cpp")
 
+    # [US-06] No original overwrite: only mutant_src (*_mutant.cpp) receives
+    # mutated_code. host_source_file_path (original repo clone file) is never
+    # written, so the pristine source stays intact for future injections.
     with open(mutant_src, "w", encoding="utf-8") as f: f.write(mutated_code)
-    if host_source_file_path and os.path.exists(os.path.dirname(host_source_file_path)):
-        with open(host_source_file_path, "w", encoding="utf-8") as f: f.write(mutated_code)
 
     # ── US-06: Compilation Verification & Rollback Safety ──────────────
     mutant_bin = mutant_src.replace(".cpp", "")
@@ -1011,15 +1232,12 @@ def _perform_injection(req: MutationInjectRequest):
         compile_err = f"Compilation exception: {type(compile_exc).__name__}: {compile_exc}"
 
     if compile_err:
-        # Rollback: restore original source file
-        if host_source_file_path and os.path.exists(os.path.dirname(host_source_file_path)):
-            with open(host_source_file_path, "w", encoding="utf-8") as f:
-                f.write(original_code)
-        # Cleanup: remove the broken mutant source file
+        # [US-06 Rollback] Original source was never overwritten (mutant-only
+        # writes), so rollback only needs mutant_src cleanup.
         if os.path.exists(mutant_src):
             os.remove(mutant_src)
         raise Exception(
-            f"[US-06 Rollback] Mutant compilation failed. Original source restored.\n"
+            f"[US-06 Rollback] Mutant compilation failed. Original source untouched (never overwritten).\n"
             f"Compiler output:\n{compile_err}"
         )
     mutant_binary_path = mutant_bin
@@ -1103,6 +1321,99 @@ Respond ONLY with a JSON object in the following format (do not include markdown
         return score, rationale
 
 
+_VALIDATION_MAX_INPUTS = 150
+_VALIDATION_PINNED_CRASH_MAX = 50
+
+def _select_validation_inputs(by_cat: dict) -> list:
+    """crash/hang 핀 고정 + queue 다양성 버킷 라운드로빈 (seed 42 고정)."""
+    import random
+    pinned = []
+    for cat in ("crashes", "hangs"):
+        pinned.extend(by_cat.get(cat, []))
+    if len(pinned) > _VALIDATION_PINNED_CRASH_MAX:
+        pinned = random.Random(42).sample(pinned, _VALIDATION_PINNED_CRASH_MAX)
+    quota = _VALIDATION_MAX_INPUTS - len(pinned)
+    buckets: dict = {}
+    for b in by_cat.get("queue", []):
+        buckets.setdefault((len(b) // 16, b[:4]), []).append(b)
+    rnd = random.Random(42)
+    for bl in buckets.values():
+        rnd.shuffle(bl)
+    order = sorted(buckets)
+    idx = {k: 0 for k in order}
+    picked = []
+    while len(picked) < quota and any(idx[k] < len(buckets[k]) for k in order):
+        for k in order:
+            if len(picked) >= quota:
+                break
+            i = idx[k]
+            if i < len(buckets[k]):
+                picked.append(buckets[k][i])
+                idx[k] += 1
+    return pinned + picked
+
+
+def _run_validation_batch(orig_binary: str, mut_binary: str, test_inputs: list,
+                          timeout_per_run: int = 5) -> tuple:
+    """원본/뮤턴트를 단일 컨테이너에서 루프 실행한다. returns (results, error)."""
+    import shutil
+    import tempfile
+    results: list = []
+    staging = tempfile.mkdtemp(prefix="faf_validate_",
+                               dir=os.path.dirname(os.path.abspath(orig_binary)))
+    try:
+        in_dir = os.path.join(staging, "inputs")
+        os.makedirs(in_dir, exist_ok=True)
+        for i, data in enumerate(test_inputs):
+            with open(os.path.join(in_dir, f"in_{i:06d}"), "wb") as f:
+                f.write(data)
+        script = (
+            "#!/bin/sh\n"
+            "ORIG=\"$1\"; MUT=\"$2\"; INDIR=\"$3\"\n"
+            "for f in \"$INDIR\"/in_*; do\n"
+            "  [ -e \"$f\" ] || continue\n"
+            "  timeout " + str(timeout_per_run) + " \"$ORIG\" < \"$f\" > /tmp/o.out 2> /tmp/o.err; r1=$?\n"
+            "  timeout " + str(timeout_per_run) + " \"$MUT\" < \"$f\" > /tmp/m.out 2> /tmp/m.err; r2=$?\n"
+            "  if cmp -s /tmp/o.out /tmp/m.out; then e=0; else e=1; fi\n"
+            "  echo \"$r1 $r2 $e\"\n"
+            "done\n"
+        )
+        script_path = os.path.join(staging, "run.sh")
+        with open(script_path, "w", newline="\n") as f:
+            f.write(script)
+        bin_dirs = []
+        for b in (orig_binary, mut_binary):
+            d = os.path.dirname(os.path.abspath(b))
+            if d not in bin_dirs:
+                bin_dirs.append(d)
+        mounts = {_host_to_docker_mount(d): f"/m{i}" for i, d in enumerate(bin_dirs)}
+        mounts[_host_to_docker_mount(staging)] = "/vin"
+        c_bins = []
+        for b in (orig_binary, mut_binary):
+            d = os.path.dirname(os.path.abspath(b))
+            c_bins.append(f"/m{bin_dirs.index(d)}/{os.path.basename(b)}")
+        res = _run_cmd_in_docker(
+            ["sh", "/vin/run.sh", c_bins[0], c_bins[1], "/vin/inputs"],
+            mounts=mounts,
+            timeout=len(test_inputs) * (timeout_per_run * 2 + 2) + 120)
+        out = res.stdout.decode("utf-8", errors="ignore") if isinstance(res.stdout, bytes) else str(res.stdout or "")
+        for line in out.splitlines():
+            parts = line.strip().split()
+            if len(parts) == 3:
+                try:
+                    results.append((int(parts[0]), int(parts[1]), int(parts[2])))
+                except ValueError:
+                    continue
+        return results, ""
+    except Exception as e:
+        return results, str(e)
+    finally:
+        try:
+            shutil.rmtree(staging, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _validation_task(task_id: int, mutant_id: int, api_key: Optional[str] = None):
     try:
         mutant = db.get_mutant(mutant_id)
@@ -1111,13 +1422,14 @@ def _validation_task(task_id: int, mutant_id: int, api_key: Optional[str] = None
 
         orig_binary, mut_binary = program.get("binary_path", ""), mutant.get("mutant_binary_path", "")
         
-        killed_count, total_runs = 0, 0
+        killed_count, outdiv_count, total_runs = 0, 0, 0
+        output_div_rate = 0.0
         COMPARE_INPUTS = [b"\x00" * 8, b"\xff" * 8, b"test\n", b"0\n", b"-1\n"]
 
-        # [US-08] AFL++ 퍼저가 생성한 입력(queue, crashes, hangs)들을 로드
-        fuzzer_inputs = []
+        # [US-08] AFL++ 퍼저가 생성한 입력(queue, crashes, hangs)들을 카테고리별로 로드
+        by_cat: dict = {"crashes": [], "hangs": [], "queue": []}
         afl_out_dir = os.path.join(AFL_OUTPUT_BASE, str(mutant["program_id"]))
-        
+
         from .data.trace_parser import _find_afl_dirs
         for subdir_name in ["crashes", "hangs", "queue"]:
             for dir_path in _find_afl_dirs(afl_out_dir, subdir_name):
@@ -1129,51 +1441,48 @@ def _validation_task(task_id: int, mutant_id: int, api_key: Optional[str] = None
                         if os.path.isfile(file_path):
                             try:
                                 with open(file_path, "rb") as f:
-                                    fuzzer_inputs.append(f.read())
+                                    by_cat[subdir_name].append(f.read())
                             except Exception:
                                 pass
 
-        # 퍼징 입력이 존재하면 사용하고, 없으면 정적 기본 입력으로 fallback
-        test_inputs = fuzzer_inputs if fuzzer_inputs else COMPARE_INPUTS
-
-        # 실행 속도 및 리소스 관리를 위해 최대 150개 입력으로 제한 (무작위 샘플링)
-        if len(test_inputs) > 150:
-            import random
-            random.seed(42)
-            test_inputs = random.sample(test_inputs, 150)
+        # 퍼징 입력이 존재하면 핀 고정 + 다양성 샘플링, 없으면 정적 기본 입력으로 fallback
+        test_inputs = _select_validation_inputs(by_cat)
+        if not test_inputs:
+            test_inputs = COMPARE_INPUTS
 
         if os.path.exists(orig_binary) and os.path.exists(mut_binary):
-            mounts = {os.path.dirname(os.path.abspath(orig_binary)): "/target"}
-            c_orig_bin = "/target/" + os.path.basename(orig_binary)
-            c_mut_bin = "/target/" + os.path.basename(mut_binary)
-
-            for test_input in test_inputs:
-                try:
-                    orig_res = _run_cmd_in_docker(["timeout", "5", c_orig_bin], mounts, timeout=10, stdin_data=test_input)
-                    mut_res = _run_cmd_in_docker(["timeout", "5", c_mut_bin], mounts, timeout=10, stdin_data=test_input)
-                    total_runs += 1
-                    # 차이(differential) 검증: 두 바이너리의 실행 결과(리턴코드)가 다르면 결함 발견(killed)으로 판단
-                    if orig_res.returncode != mut_res.returncode:
-                        killed_count += 1
-                except subprocess.TimeoutExpired: pass
+            results, batch_err = _run_validation_batch(orig_binary, mut_binary, test_inputs)
+            if batch_err and not results:
+                raise Exception(f"Validation batch failed: {batch_err}")
+            for r1, r2, e in results:
+                total_runs += 1
+                # 차이(differential) 검증: 리턴코드가 다르면 killed,
+                # 같고 stdout만 다르면 출력 분기로 별도 집계한다.
+                if r1 != r2:
+                    killed_count += 1
+                elif e == 1:
+                    outdiv_count += 1
 
         survival_rate = ((total_runs - killed_count) / total_runs * 100.0) if total_runs > 0 else (90.0 if os.path.exists(afl_out_dir) else 0.0)
+        output_div_rate = (outdiv_count / total_runs * 100.0) if total_runs > 0 else 0.0
 
         # ── LLM 평가 (생존율 ≥ 95% 시) ───────────────────────────────
         # [수정] 자동 정성 평가는 수행하지 않고 수동 정성 평가만 지원
         llm_score = None
         llm_rationale = None
 
-        db.update_mutant_validation(mutant_id, survival_rate, llm_score, llm_rationale, total_runs)
+        db.update_mutant_validation(mutant_id, survival_rate, llm_score, llm_rationale, total_runs,
+                                        output_div_rate=output_div_rate)
         TASK_STATUS[task_id] = {
-            "status": "completed", 
+            "status": "completed",
             "result": {
-                "survival_rate": survival_rate, 
+                "survival_rate": survival_rate,
+                "output_divergence_rate": output_div_rate,
                 "llm_score": f"{int(llm_score)}/10" if llm_score is not None else "N/A",
                 "llm_reasoning": llm_rationale or "평가 대기 중 또는 점수 없음"
             }
         }
-        print(f"[Validation Docker] mutant_id={mutant_id} survival_rate={survival_rate:.1f}%")
+        print(f"[Validation Docker] mutant_id={mutant_id} survival_rate={survival_rate:.1f}% output_div={output_div_rate:.1f}%")
     except Exception as e:
         TASK_STATUS[task_id] = {"status": "failed", "error": str(e)}
 
@@ -1208,11 +1517,12 @@ async def gemini_evaluate_mutant(
     try:
         llm_score, llm_rationale = _run_gemini_evaluation(mutant, key)
         db.update_mutant_validation(
-            mutant_id, 
-            survival_rate=mutant.get("survival_rate", 0.0), 
-            llm_score=llm_score, 
+            mutant_id,
+            survival_rate=mutant.get("survival_rate", 0.0),
+            llm_score=llm_score,
             llm_rationale=llm_rationale,
-            total_execs=mutant.get("total_execs", 0)
+            total_execs=mutant.get("total_execs", 0),
+            output_div_rate=mutant.get("output_div_rate")
         )
         return {"status": "success", "llm_score": llm_score, "llm_rationale": llm_rationale}
     except Exception as e:
@@ -1222,7 +1532,9 @@ async def gemini_evaluate_mutant(
 @app.get("/api/v1/mutations/{mutant_id}/report")
 async def generate_report(mutant_id: int):
     if not db.get_mutant(mutant_id): raise HTTPException(status_code=404, detail="Mutant not found.")
-    return Response(content=b"%PDF-1.4 FindAndFixMe Report", media_type="application/pdf")
+    # [T2] PDF export is frontend-only (see frontend/app.py create_pdf_report);
+    # the previous dummy b"%PDF-1.4..." payload was a silent fake, so fail loudly.
+    raise HTTPException(status_code=501, detail="PDF export is frontend-only (see frontend/app.py create_pdf_report)")
 
 
 @app.get("/api/v1/mutations/history")
@@ -1257,6 +1569,7 @@ async def get_mutations_history():
             "pattern": pattern_name,
             "total_execs": rec.get("total_execs") or db.get_trace_count(rec.get("program_id")) or 100,
             "survival_rate": rec.get("survival_rate") if rec.get("survival_rate") is not None else 0.0,
+            "output_divergence": rec.get("output_div_rate") if rec.get("output_div_rate") is not None else 0.0,
             "llm_score": f"{int(rec.get('llm_score'))}/10" if rec.get("llm_score") is not None else "N/A",
             "llm_reasoning": rec.get("llm_rationale") or "평가 대기 중 또는 점수 없음",
             "retry_count": 0,

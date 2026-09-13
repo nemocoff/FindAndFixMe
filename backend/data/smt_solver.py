@@ -9,8 +9,7 @@ US-04: Z3 SMT Solver 기반 트리거 조건 역산
 
 import ast
 import logging
-import multiprocessing
-import queue
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Dict, List, Any, Union, Optional
 import z3
 
@@ -53,25 +52,38 @@ class ASTToZ3Translator:
                 raise NotImplementedError(f"지원하지 않는 이항 연산자: {type(node.op)}")
 
         elif isinstance(node, ast.Compare):
-            left = self.translate_expr(node.left)
-            # 단일 비교 연산 지원 (예: x > 5)
-            op = node.ops[0]
-            right = self.translate_expr(node.comparators[0])
+            # chained compare 지원 (예: a < b < c => And(a < b, b < c))
+            operands = [self.translate_expr(node.left)] + [
+                self.translate_expr(c) for c in node.comparators
+            ]
+            parts = []
+            for op, left, right in zip(node.ops, operands, operands[1:]):
+                if isinstance(op, ast.Gt):
+                    parts.append(left > right)
+                elif isinstance(op, ast.GtE):
+                    parts.append(left >= right)
+                elif isinstance(op, ast.Lt):
+                    parts.append(left < right)
+                elif isinstance(op, ast.LtE):
+                    parts.append(left <= right)
+                elif isinstance(op, ast.Eq):
+                    parts.append(left == right)
+                elif isinstance(op, ast.NotEq):
+                    parts.append(left != right)
+                else:
+                    raise NotImplementedError(f"지원하지 않는 비교 연산자: {type(op)}")
+            if len(parts) == 1:
+                return parts[0]
+            return z3.And(*parts)
 
-            if isinstance(op, ast.Gt):
-                return left > right
-            elif isinstance(op, ast.GtE):
-                return left >= right
-            elif isinstance(op, ast.Lt):
-                return left < right
-            elif isinstance(op, ast.LtE):
-                return left <= right
-            elif isinstance(op, ast.Eq):
-                return left == right
-            elif isinstance(op, ast.NotEq):
-                return left != right
+        elif isinstance(node, ast.BoolOp):
+            values = [self.translate_expr(v) for v in node.values]
+            if isinstance(node.op, ast.And):
+                return z3.And(*values)
+            elif isinstance(node.op, ast.Or):
+                return z3.Or(*values)
             else:
-                raise NotImplementedError(f"지원하지 않는 비교 연산자: {type(op)}")
+                raise NotImplementedError(f"지원하지 않는 불리언 연산자: {type(node.op)}")
 
         elif isinstance(node, ast.Name):
             return self.get_var(node.id)
@@ -92,13 +104,12 @@ class ASTToZ3Translator:
             raise NotImplementedError(f"지원하지 않는 AST 노드 타입: {type(node)}")
 
 
-def _solver_worker(conditions: List[str], result_queue: multiprocessing.Queue):
-    """
-    별도 프로세스에서 실행되어 Z3 Solver를 풀고 결과를 큐에 저장하는 워커 함수.
-    """
+def _solve_sync(conditions: List[str], timeout_ms: int) -> tuple:
+    """호출 스레드에서 Z3 풀이를 수행한다. 스레드풀이 타임아웃을 강제한다."""
     try:
         translator = ASTToZ3Translator()
         solver = z3.Solver()
+        solver.set("timeout", timeout_ms)
 
         for cond_str in conditions:
             # 문자열 수식을 AST로 변환
@@ -120,14 +131,14 @@ def _solver_worker(conditions: List[str], result_queue: multiprocessing.Queue):
                     result_dict[name] = float(val.as_decimal(4))
                 else:
                     result_dict[name] = str(val)
-            result_queue.put(("SUCCESS", result_dict))
+            return ("SUCCESS", result_dict)
         elif check_res == z3.unsat:
-            result_queue.put(("UNSAT", "분석 불가 (Unsatisfiable Constraints)"))
+            return ("UNSAT", "분석 불가 (Unsatisfiable Constraints)")
         else:
-            result_queue.put(("UNKNOWN", "분석 불가 (Unknown SMT Result)"))
-            
+            return ("UNKNOWN", "분석 불가 (Unknown SMT Result)")
+
     except Exception as e:
-        result_queue.put(("ERROR", f"분석 불가 (Error: {str(e)})"))
+        return ("ERROR", f"분석 불가 (Error: {str(e)})")
 
 
 class SMTSolver:
@@ -148,33 +159,22 @@ class SMTSolver:
         Returns:
             Union[Dict[str, Any], str]: 역산 성공 시 변수 매핑 딕셔너리, 실패/타임아웃 시 '분석 불가 ...' 문자열 반환
         """
-        # 멀티프로세싱을 통한 3초 타임아웃 강제
-        result_queue = multiprocessing.Queue()
-        process = multiprocessing.Process(
-            target=_solver_worker, 
-            args=(conditions, result_queue)
-        )
-        
+        # 스레드풀 + future 타임아웃 강제 (프로세스/세마포어 없이 동작)
         try:
-            process.start()
-            # 지정된 시간 동안 큐에서 대기
-            status, val = result_queue.get(timeout=self.timeout_sec)
-            process.join()
-            
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    _solve_sync, conditions, int(self.timeout_sec * 1000))
+                try:
+                    status, val = future.result(timeout=self.timeout_sec)
+                except FuturesTimeoutError:
+                    logger.warning(f"SMT Solver timed out after {self.timeout_sec} seconds.")
+                    return "분석 불가 (Timeout)"
+
             if status == "SUCCESS":
                 return val
             else:
                 return val # 에러 메시지 반환
-                
-        except queue.Empty:
-            logger.warning(f"SMT Solver timed out after {self.timeout_sec} seconds.")
-            # 타임아웃 시 프로세스 즉각 종료
-            process.terminate()
-            process.join()
-            return "분석 불가 (Timeout)"
+
         except Exception as e:
             logger.error(f"Unexpected error in SMT solver: {e}")
-            if process.is_alive():
-                process.terminate()
-                process.join()
             return f"분석 불가 (Exception: {str(e)})"

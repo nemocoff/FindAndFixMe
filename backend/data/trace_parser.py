@@ -14,7 +14,6 @@ import os
 import hashlib
 import json
 import subprocess
-import random
 import tempfile
 from typing import Dict, List, Tuple, Any
 
@@ -30,6 +29,9 @@ AFL_SOURCE_DIRS = [
 # crashes/hangs는 exec_frequency가 정의상 0.001로 고정
 CRASH_EXEC_FREQ = 0.001
 CORNER_CASE_THRESHOLD = 0.15   # 15% 미만 = 코너 케이스
+
+# Docker 이미지는 환경변수로 오버라이드 가능 (기본값: 로컬 빌드 이미지)
+DOCKER_IMAGE = os.environ.get("DOCKER_IMAGE", "findandfixme/aflplusplus:latest")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,7 +207,7 @@ def _run_afl_showmap_bulk(afl_binary_path: str, seed_dir: str) -> Dict[str, int]
         "-e", "AFL_FORKSRV_INIT_TMOUT=5000",
         "-v", f"{prog_dir}:{prog_dir}",
         "-v", f"{abs_seed_dir}:{abs_seed_dir}",
-        "findandfixme/aflplusplus:latest",
+        DOCKER_IMAGE,
         "afl-showmap",
         "-C",                    # 모든 입력의 커버리지 누적
         "-i", abs_seed_dir,      # 입력 디렉토리
@@ -279,7 +281,7 @@ def _run_afl_showmap_bulk_stdin(afl_binary_path: str, seed_dir: str) -> Dict[str
         "-e", "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1",
         "-v", f"{prog_dir}:{prog_dir}",
         "-v", f"{abs_seed_dir}:{abs_seed_dir}",
-        "findandfixme/aflplusplus:latest",
+        DOCKER_IMAGE,
         "afl-showmap",
         "-C",
         "-i", abs_seed_dir,
@@ -356,6 +358,12 @@ def _run_afl_showmap_per_seed(
             print(f"[afl-showmap PerSeed] Copy failed {sf}: {e}")
 
     if not seed_index:
+        # 복사 실패 시 생성된 빈 임시 디렉토리도 정리
+        for _tmp in (tmp_seed_dir, tmp_maps_dir):
+            try:
+                shutil.rmtree(_tmp)
+            except Exception:
+                pass
         return {}
 
     # 컨테이너 내부 배치 스크립트: 각 시드마다 afl-showmap 실행
@@ -385,50 +393,57 @@ def _run_afl_showmap_per_seed(
         "-v", f"{prog_dir}:{prog_dir}",
         "-v", f"{tmp_seed_dir}:{tmp_seed_dir}",
         "-v", f"{tmp_maps_dir}:{tmp_maps_dir}",
-        "findandfixme/aflplusplus:latest",
+        DOCKER_IMAGE,
         "sh", script_path
     ]
 
     print(f"[afl-showmap PerSeed] Running batch script in 1 Docker call...")
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=300)
-        stderr_str = result.stderr.decode("utf-8", errors="ignore")
-        print(f"[afl-showmap PerSeed] Return code: {result.returncode}")
-        if stderr_str and len(stderr_str) < 500:
-            print(f"[afl-showmap PerSeed] stderr: {stderr_str}")
-    except subprocess.TimeoutExpired:
-        print("[afl-showmap PerSeed] Batch timeout!")
-    except Exception as e:
-        print(f"[afl-showmap PerSeed] Exception: {e}")
-
-    # 결과 파싱
     per_seed_maps = {}
-    for seed_name, orig_path in seed_index.items():
-        map_file = os.path.join(tmp_maps_dir, f"{seed_name}.map")
-        edge_map = {}
-        if os.path.exists(map_file):
-            try:
-                with open(map_file, "r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if ":" in line:
-                            parts = line.split(":")
-                            if len(parts) == 2:
-                                try:
-                                    edge_map[parts[0].strip()] = int(parts[1].strip())
-                                except ValueError:
-                                    pass
-            except Exception:
-                pass
-        per_seed_maps[orig_path] = edge_map
-
-    # 임시 파일 정리
     try:
-        shutil.rmtree(tmp_seed_dir)
-        shutil.rmtree(tmp_maps_dir)
-        os.remove(script_path)
-    except Exception:
-        pass
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=300)
+            stderr_str = result.stderr.decode("utf-8", errors="ignore")
+            print(f"[afl-showmap PerSeed] Return code: {result.returncode}")
+            if stderr_str and len(stderr_str) < 500:
+                print(f"[afl-showmap PerSeed] stderr: {stderr_str}")
+        except subprocess.TimeoutExpired:
+            print("[afl-showmap PerSeed] Batch timeout!")
+        except Exception as e:
+            print(f"[afl-showmap PerSeed] Exception: {e}")
+
+        # 결과 파싱
+        for seed_name, orig_path in seed_index.items():
+            map_file = os.path.join(tmp_maps_dir, f"{seed_name}.map")
+            edge_map = {}
+            if os.path.exists(map_file):
+                try:
+                    with open(map_file, "r") as f:
+                        for line in f:
+                            line = line.strip()
+                            if ":" in line:
+                                parts = line.split(":")
+                                if len(parts) == 2:
+                                    try:
+                                        edge_map[parts[0].strip()] = int(parts[1].strip())
+                                    except ValueError:
+                                        pass
+                except Exception:
+                    pass
+            per_seed_maps[orig_path] = edge_map
+    finally:
+        # 임시 파일 정리 (예외/타임아웃 시에도 항상 수행)
+        try:
+            shutil.rmtree(tmp_seed_dir)
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(tmp_maps_dir)
+        except Exception:
+            pass
+        try:
+            os.remove(script_path)
+        except Exception:
+            pass
 
     covered = sum(1 for m in per_seed_maps.values() if m)
     print(f"[afl-showmap PerSeed] {covered}/{len(sampled)} seeds produced coverage maps")
@@ -451,7 +466,7 @@ def _extract_function_names_via_nm(binary_path: str) -> Dict[str, str]:
         "--network", "none",
         "--user", "root",
         "-v", f"{prog_dir}:{prog_dir}",
-        "findandfixme/aflplusplus:latest",
+        DOCKER_IMAGE,
         "nm", "--demangle", "--defined-only", "-n",
         abs_binary
     ]
@@ -514,8 +529,9 @@ def _compute_exec_frequency_from_showmap(
         for edge_id in edge_map:
             edge_seed_count[edge_id] = edge_seed_count.get(edge_id, 0) + 1
 
-    # 각 시드의 exec_frequency = 해당 시드의 edge들의 평균 hit rate
-    # (많이 공유되는 edge = 높은 빈도, 희귀 edge만 가진 시드 = 낮은 빈도)
+    # 각 시드의 exec_frequency = 커버한 edge 중 가장 희귀한 edge의 점유율.
+    # 희귀 코드를 한 번이라도 밟은 시드는 코너케이스다 (기존 1-희귀비율은
+    # 공통 prologue/main edge에 희석되어 단일 함수 novelty를 놓쳤다).
     seed_freq = {}
     for seed_path, edge_map in per_seed_maps.items():
         if not edge_map:
@@ -523,16 +539,9 @@ def _compute_exec_frequency_from_showmap(
             seed_freq[seed_path] = 0.5
             continue
 
-        # 이 시드에서만 hit되는 edge 비율로 희소성 계산
-        rare_edges = sum(1 for eid in edge_map if edge_seed_count.get(eid, 0) <= 2)
-        rarity_ratio = rare_edges / len(edge_map) if edge_map else 0
-
-        # exec_frequency = 1 - rarity_ratio
-        # (희귀 edge가 많을수록 낮은 exec_frequency → 코너케이스)
-        freq = 1.0 - rarity_ratio
-        # 최솟값 보정
-        freq = max(freq, 0.001)
-        seed_freq[seed_path] = freq
+        min_share = min(
+            edge_seed_count.get(eid, total_seeds) / total_seeds for eid in edge_map)
+        seed_freq[seed_path] = max(min_share, 0.0001)
 
     return seed_freq
 
@@ -608,7 +617,7 @@ def _run_binary_in_docker(binary_path: str, stdin_data: bytes) -> Tuple[str, int
         "--network", "none",
         "--user", "root",
         "-v", mounts_opt,
-        "findandfixme/aflplusplus:latest",
+        DOCKER_IMAGE,
         container_binary
     ]
 
@@ -678,7 +687,7 @@ def _resolve_addresses_with_addr2line(binary_path: str, addresses: List[str]) ->
         "--network", "none",
         "--user", "root",
         "-v", mounts_opt,
-        "findandfixme/aflplusplus:latest",
+        DOCKER_IMAGE,
         "addr2line", "-f", "-C", "-e", container_binary
     ] + addresses
 
@@ -996,7 +1005,7 @@ def parse_afl_output(afl_out_dir: str, program_id: int, db: TraceDBManager) -> D
                 exec_freq = loc_hits[code_loc] / denom_resolved
 
             if exec_freq < 0.0001:
-                exec_freq = 0.0001 + (random.random() * 0.0003)
+                exec_freq = 0.0001
 
         if exec_freq < CORNER_CASE_THRESHOLD:
             try:
@@ -1103,7 +1112,8 @@ def build_trace_tree(program_id: int, db: TraceDBManager) -> Dict[str, Any]:
         conn.row_factory = sqlite3.Row
 
         cc_nodes = conn.execute(
-            "SELECT trace_id, exec_frequency, code_location FROM CornerCaseNode"
+            "SELECT c.trace_id, c.exec_frequency, c.code_location FROM CornerCaseNode c JOIN DynamicTrace t ON c.trace_id=t.id WHERE t.program_id=?",
+            (program_id,),
         ).fetchall()
 
         cc_map = {}

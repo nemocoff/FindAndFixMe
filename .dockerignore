@@ -1,0 +1,11 @@
+.git
+__pycache__
+*.pyc
+.venv
+venv
+afl_output
+temp_targets
+scratch
+*.sqlite*
+*.db
+.streamlit

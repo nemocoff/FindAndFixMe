@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # FastAPI 백엔드 서버
   backend:
@@ -17,9 +15,15 @@ services:
       - MUTATION_ENGINE_BIN=/app/core/build/MutationEngine
     command: >
       sh -c "apt-get update -q &&
-             apt-get install -y docker-cli -q &&
+             apt-get install -y docker-cli curl -q &&
              pip install -r requirements.txt -q &&
              uvicorn backend.api:app --host 0.0.0.0 --port 8000 --reload"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/docs || wget -qO- http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     depends_on:
       - sandbox
 

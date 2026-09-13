@@ -6,9 +6,7 @@
 #include <map>
 #include <future>
 #include <chrono>
-#include <cstdlib>
 #include <cstdio>
-#include <unistd.h>
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -83,6 +81,11 @@ std::string escapeJSON(const std::string& input) {
         else if (c == '\n') output += "\\n";
         else if (c == '\r') output += "\\r";
         else if (c == '\t') output += "\\t";
+        else if (static_cast<unsigned char>(c) < 0x20) {
+            char buf[7];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+            output += buf;
+        }
         else                output += c;
     }
     return output;
@@ -550,44 +553,10 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// [T11] 변조 코드 재컴파일
-// ─────────────────────────────────────────────────────────────────────────────
-bool recompileMutant(const std::string& mutatedCode, std::string& outBinaryPath) {
-    // 임시 소스 파일 생성
-    char tmpSrc[] = "/tmp/faf_mutant_XXXXXX.cpp";
-    int fd = mkstemps(tmpSrc, 4);
-    if (fd < 0) return false;
-
-    if (write(fd, mutatedCode.c_str(), mutatedCode.size()) < 0) {
-        close(fd);
-        return false;
-    }
-    close(fd);
-
-    // 출력 바이너리 경로
-    outBinaryPath = std::string(tmpSrc) + "_bin";
-
-    // clang++ 재컴파일
-    std::string cmd = "clang++-16 -std=c++17 -o " + outBinaryPath + " " + tmpSrc + " 2>/dev/null";
-    int ret = std::system(cmd.c_str());
-    return (ret == 0);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // [US-04] Z3 SMT 제약 풀이 (타임아웃 포함)
 // ─────────────────────────────────────────────────────────────────────────────
 void solveConstraintWithTimeout() {
-    try {
-        z3::context c;
-        z3::solver  s(c);
-        z3::params  p(c);
-        p.set("timeout", 3000u);   // 3초 Z3 타임아웃
-        s.set(p);
-        // TODO: 실제 경로 도달 가능성 제약식 추가
-        if (s.check() == z3::sat) { /* sat */ }
-    } catch (z3::exception& ex) {
-        std::cerr << "[Z3] Exception: " << ex.msg() << std::endl;
-    }
+    // TODO(US-04): wire real path constraints — currently stub
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -610,7 +579,7 @@ public:
         // [T10] 패턴 ID 유효성 검사
         if (patternId != 0 && PATTERN_REGISTRY.find(patternId) == PATTERN_REGISTRY.end()) {
             outputError("Invalid pattern-id: " + std::to_string(patternId) +
-                        ". Must be 0 (all) or 1~15.");
+                        ". Must be 0 (all) or 1~14.");
             return 1;
         }
 
@@ -638,20 +607,13 @@ public:
         // Z3 제약 풀이
         solveConstraintWithTimeout();
 
-        // [T11] 재컴파일
-        std::string mutant_binary_path;
-        bool recompiled = recompileMutant(mutated_code, mutant_binary_path);
-
-        // JSON 출력
+        // JSON 출력 (재컴파일은 백엔드 _compile_regular이 담당하므로 여기서 수행하지 않음)
         std::cout << "{";
         std::cout << "\"status\": \"success\", ";
         std::cout << "\"pattern_id\": " << patternId << ", ";
 
         if (patternId != 0 && PATTERN_REGISTRY.count(patternId))
             std::cout << "\"pattern_name\": \"" << PATTERN_REGISTRY.at(patternId) << "\", ";
-
-        std::cout << "\"recompiled\": " << (recompiled ? "true" : "false") << ", ";
-        std::cout << "\"mutant_binary\": \"" << escapeJSON(mutant_binary_path) << "\", ";
 
         std::cout << "\"mutations\": [";
         for (size_t i = 0; i < mutations_log.size(); ++i) {

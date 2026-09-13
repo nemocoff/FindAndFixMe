@@ -94,7 +94,8 @@ void pointer_operations() {
 // ── CWE-682: 산술/논리/비트 연산 오류 주입 대상 함수 ──
 int logic_and_math(int a, int b) {
     int rem = a % b; // ← CWE-682 주입 포인트 #1
-    int mul = a * b; // ← CWE-682 주입 포인트 #2
+    int mul = a;
+    mul *= b; // ← 복합대입이라 CWE-190 매처 미대상 (동작 동일, 핫 경로 매칭 제거)
     bool cond = (a > 0) && (b > 0); // ← CWE-682 주입 포인트 #3
     return rem + mul + cond;
 }
@@ -420,6 +421,49 @@ void cwe415_processing(uint8_t val) {
     std::cout << "cwe415_path: n=" << n << std::endl;
 }
 
+// ── 콜드패스 전용 주입 표면 (buf[2]==10에서만 도달, 핫 경로에서 호출 없음) ──
+// --target-func=cold_surface_processing 지정 시 결함이 이 함수에만 주입된다.
+void cold_surface_processing(uint8_t val) {
+    int mul = (int)val * 3;              // CWE-190 (* in decl)
+    int arr[8] = {};
+    for (int i = 0; i < 8; i++) {        // CWE-193 (<), CWE-835 (i++)
+        arr[i] = i * 2;
+    }
+    if (mul == 0) {                      // CWE-369 (== 0)
+        return;
+    }
+    int div = 100 / (mul != 0 ? mul : 1);
+    int* p = new int[8];                 // CWE-125/787 (new[]), CWE-415 (delete)
+    for (int j = 0; j < 8; j++) {
+        p[j] = arr[j];
+    }
+    if (p == nullptr) {                  // CWE-476 (nullptr 검사)
+        return;
+    }
+    if (val > 0 && mul > 0) {            // CWE-682 (&& in if)
+        p[0] += 1;
+    }
+    int zero = 0;                        // CWE-457 (= 0)
+    char msg[32] = {};
+    snprintf(msg, sizeof(msg), "input_%d", val);
+    printf("%s", msg);                   // CWE-134 ("%s")
+    printf("\n");
+    memcpy(msg, msg, 8 * sizeof(char));  // CWE-131 (3번째 인자에 *)
+    char* tmp = (char*)malloc(16);       // CWE-401 (free 대상)
+    if (tmp != nullptr) {
+        tmp[0] = (char)val;
+    }
+    free(tmp);                           // CWE-401
+    (void)zero;
+    (void)div;
+    delete[] p;                          // CWE-401 (delete)
+    p = nullptr;                         // CWE-416 (= nullptr)
+    if (val == 42) {
+        throw std::runtime_error("cold_surface");  // CWE-390 (throw)
+    }
+    std::cout << "cold_surface: mul=" << mul << std::endl;
+}
+
 // ── 퍼저 호출 경로 분기용 헬퍼 함수 ──
 void common_processing(uint8_t val) {
     int data[8] = {};
@@ -470,6 +514,7 @@ void critical_edge_case(uint8_t val) {
 //             1=CWE-416  2=CWE-125/787  3=CWE-362
 //             4=CWE-457  5=CWE-369      6=CWE-835
 //             7=CWE-131  8=CWE-134      9=CWE-415
+//             10=COLD surface (cold_surface_processing, 14패턴 집약)
 //   buf[3] : 신규 패턴의 서브 입력값
 // ═════════════════════════════════════════════════════════════════════════════
 int main() {
@@ -514,6 +559,9 @@ int main() {
         return 0;
     } else if (new_pattern == 9) {
         cwe415_processing(sub_val);  // CWE-415: Double Free
+        return 0;
+    } else if (new_pattern == 10) {
+        cold_surface_processing(sub_val);  // COLD surface: 14-pattern injection target
         return 0;
     }
 

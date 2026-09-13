@@ -161,7 +161,7 @@ def render_trace_tree_and_table(tree_data=None, cc_data=None, total_traces=0, ex
                     "hideOverlap": True
                 },
                 "expandAndCollapse": True,
-                "initialTreeDepth": -1,
+                "initialTreeDepth": 3,
                 "lineStyle": {"width": 2, "curveness": 0.5}
             }
         ]

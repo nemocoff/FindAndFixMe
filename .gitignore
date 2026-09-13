@@ -42,3 +42,7 @@ core/build/
 *.sqlite-shm
 *.sqlite-wal
 
+# Local agent instructions (do not commit)
+AGENTS.md
+*.log
+

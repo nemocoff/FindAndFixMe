@@ -145,7 +145,9 @@ class TraceDBManager:
             # migration: injected_pattern_id CHECK 제약조건 범위 확장 (1~6 -> >= 1)
             try:
                 schema_row = cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='MutantRecord'").fetchone()
-                if schema_row and "BETWEEN 1 AND 6" in schema_row[0]:
+                if schema_row is None or schema_row[0] is None:
+                    pass
+                elif "BETWEEN 1 AND 6" in schema_row[0]:
                     cursor.execute("""
                         CREATE TABLE MutantRecord_migrated (
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,6 +186,11 @@ class TraceDBManager:
             # migration: injected_pattern_name 컬럼 추가
             try:
                 cursor.execute("ALTER TABLE MutantRecord ADD COLUMN injected_pattern_name TEXT")
+            except Exception:
+                pass
+            # migration: output_div_rate 컬럼 추가 (stdout-only 분기율)
+            try:
+                cursor.execute("ALTER TABLE MutantRecord ADD COLUMN output_div_rate REAL")
             except Exception:
                 pass
 
@@ -232,7 +239,7 @@ class TraceDBManager:
     # ─────────────────────────────────────────────
     def insert_corner_case(self, trace_id: int, node_type: str,
                            exec_frequency: float, code_location: str = "") -> int:
-        """exec_frequency < 0.01 조건은 DB CHECK 제약이 1차 방어선."""
+        """CornerCaseNode에 코너 케이스 INSERT. (CHECK 제약 없음 — 호출자에서 exec_frequency 검증 필요)."""
         with get_db_connection(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -251,7 +258,7 @@ class TraceDBManager:
                       injected_pattern_name: str = "") -> int:
         """
         Integrity Rule 1: original == mutated 이면 ValueError.
-        Integrity Rule 2: pattern_id 1~6 범위는 DB CHECK가 강제.
+        Integrity Rule 2: pattern_id >=1 (registry 1~14) 범위는 DB CHECK가 강제.
         """
         if original_code.strip() == mutated_code.strip():
             raise ValueError("Integrity Rule 1 Failed: mutated_code is identical to original_code.")
@@ -270,13 +277,19 @@ class TraceDBManager:
     def update_mutant_validation(self, mutant_id: int, survival_rate: float,
                                  llm_score: Optional[float],
                                  llm_rationale: Optional[str],
-                                 total_execs: Optional[int] = None) -> None:
+                                 total_execs: Optional[int] = None,
+                                 output_div_rate: Optional[float] = None) -> None:
         with get_db_connection(self.db_path) as conn:
+            try:
+                conn.execute("ALTER TABLE MutantRecord ADD COLUMN output_div_rate REAL")
+            except Exception:
+                pass
             conn.execute(
                 """UPDATE MutantRecord
-                   SET survival_rate=?, llm_score=?, llm_rationale=?, total_execs=?, validated_at=CURRENT_TIMESTAMP
+                   SET survival_rate=?, llm_score=?, llm_rationale=?, total_execs=?,
+                       output_div_rate=?, validated_at=CURRENT_TIMESTAMP
                    WHERE id=?""",
-                (survival_rate, llm_score, llm_rationale, total_execs, mutant_id)
+                (survival_rate, llm_score, llm_rationale, total_execs, output_div_rate, mutant_id)
             )
             conn.commit()
 
@@ -335,6 +348,7 @@ class TraceDBManager:
                     m.validated_at,
                     m.created_at,
                     m.injected_pattern_name,
+                    m.output_div_rate,
                     t.file_path,
                     t.original_code,
                     t.source_file_path,

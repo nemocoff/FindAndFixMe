@@ -1,5 +1,6 @@
 import streamlit as st
 import json
+import re
 import streamlit.components.v1 as components
 
 def render_diff_viewer(old_code: str, new_code: str, trigger_input: str = ""):
@@ -42,14 +43,14 @@ def render_diff_viewer(old_code: str, new_code: str, trigger_input: str = ""):
 def render_rich_diff_viewer(raw_diff_string):
     """diff2html.js를 사용하여 GitHub 스타일의 미려한 Diff 뷰어를 렌더링합니다."""
     
-    safe_diff = json.dumps(raw_diff_string)
+    safe_diff = json.dumps(re.sub(r'</script', r'<\\/script', raw_diff_string, flags=re.IGNORECASE))
     
     html_template = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css" />
-        <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/diff2html/bundles/js/diff2html-ui.min.js"></script>
+        <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css" referrerpolicy="no-referrer" />
+        <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/diff2html/bundles/js/diff2html-ui.min.js" referrerpolicy="no-referrer"></script>
         
         <style>
             /* 1. 회원님이 찾으신 CSS 루트 변수 무력화 */
@@ -69,6 +70,8 @@ def render_rich_diff_viewer(raw_diff_string):
     </head>
     <body style="margin: 0; font-family: sans-serif;">
         <div id="diff-ui"></div>
+        <noscript>Diff viewer requires JavaScript. Please enable JavaScript or view the raw unified diff.</noscript>
+        <pre id="diff-fallback" style="display: none; white-space: pre-wrap; word-break: break-all;"></pre>
         <script>
             document.addEventListener('DOMContentLoaded', function () {{
                 var diffString = {safe_diff};
@@ -82,8 +85,17 @@ def render_rich_diff_viewer(raw_diff_string):
                     renderNothingWhenEmpty: false,
                 }};
                 
-                var diff2htmlUi = new Diff2HtmlUI(targetElement, diffString, configuration);
-                diff2htmlUi.draw();
+                try {{
+                    if (typeof Diff2HtmlUI === 'undefined') {{
+                        throw new Error('Diff2Html CDN failed to load');
+                    }}
+                    var diff2htmlUi = new Diff2HtmlUI(targetElement, diffString, configuration);
+                    diff2htmlUi.draw();
+                }} catch (err) {{
+                    var fallback = document.getElementById('diff-fallback');
+                    fallback.style.display = 'block';
+                    fallback.textContent = diffString;
+                }}
             }});
         </script>
     </body>

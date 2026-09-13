@@ -1,9 +1,9 @@
-fastapi
-uvicorn
-python-multipart
-streamlit
-requests
-google-generativeai
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+python-multipart>=0.0.9
+streamlit>=1.33,<2
+requests>=2.31
+google-generativeai>=0.5
 streamlit-echarts==0.4.0 # V2 컴포넌트 충돌 방지를 위해 안정화 버전으로 고정
-z3-solver
-FPDF2
+z3-solver>=4.12
+FPDF2>=2.7

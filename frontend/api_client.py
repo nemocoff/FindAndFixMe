@@ -1,7 +1,8 @@
+import os
 import requests
 import time
 
-API_BASE_URL = "http://localhost:8000/api/v1"
+API_BASE_URL = os.environ.get("FINDANDFIXME_API_URL", "http://localhost:8000/api/v1")
 # 네트워크 연결 타임아웃 및 읽기 타임아웃 기본값 (연결 10초, 읽기 30초)
 DEFAULT_REQ_TIMEOUT = (10, 30) 
 
