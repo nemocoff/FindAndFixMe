@@ -70,6 +70,12 @@ static const std::map<int, std::string> PATTERN_REGISTRY = {
     {12, "CWE-131 Missing sizeof in memcpy"},
     {13, "CWE-134 Uncontrolled Format String"},
     {14, "CWE-415 Double Free (Copy-Paste Error)"},
+    {15, "CWE-484 Omitted Break Statement in Switch"},
+    {16, "CWE-676 Use of Potentially Dangerous Function (strncpy -> strcpy)"},
+    {17, "CWE-482 Comparing instead of Assigning"},
+    {18, "CWE-481 Assigning instead of Comparing (in Condition)"},
+    {19, "CWE-772 Missing Release of Resource (File Descriptor Leak)"},
+    {20, "CWE-170 Improper Null Termination"},
 };
 
 // JSON 이스케이프 헬퍼
@@ -344,9 +350,77 @@ public:
                     
                     mutations_log.push_back({14, "CWE-415 Double Free (Copy-Paste Error)", "injected"});
                 }
-            }w
+            }
         }
 
+        // ── [검증 완료] CWE-484: Switch 문 Fallthrough 유발 ───────────────────────
+        if (targetPatternId == 0 || targetPatternId == 15) {
+            if (const BreakStmt* Break = Result.Nodes.getNodeAs<BreakStmt>("cwe484_break")) {
+                // 개발자가 case 마지막에 break를 적는 것을 깜빡한 상황 모방
+                // 다음 case 구문까지 줄줄이 실행되는 심각한 논리 오류(Fallthrough) 발생
+                Rewrite.ReplaceText(Break->getSourceRange(), "/* break omitted (fallthrough) */");
+                mutations_log.push_back({15, "CWE-484 Omitted Break in Switch", "injected"});
+            }
+        }
+
+        // ── [검증 완료] CWE-676: 안전한 함수(strncpy)를 위험한 함수(strcpy)로 강등 ──────────
+        if (targetPatternId == 0 || targetPatternId == 16) {
+            if (const CallExpr* Call = Result.Nodes.getNodeAs<CallExpr>("cwe676_call")) {
+                // strncpy(dest, src, size) 에서 인자 2개만 추출
+                if (Call->getNumArgs() >= 2) {
+                    std::string destStr = getExprString(Call->getArg(0));
+                    std::string srcStr = getExprString(Call->getArg(1));
+                    
+                    if (!destStr.empty() && !srcStr.empty()) {
+                        // 길이 제한(size) 인자를 날려버리고 strcpy로 덮어씌움 (버퍼 오버플로우 유발)
+                        std::string mutatedCall = "strcpy(" + destStr + ", " + srcStr + ")";
+                        Rewrite.ReplaceText(Call->getSourceRange(), mutatedCall);
+                        
+                        mutations_log.push_back({16, "CWE-676 Dangerous Function (strncpy -> strcpy)", "injected"});
+                    }
+                }
+            }
+        }
+
+        // ── [검증 완료] CWE-482: 대입(=)을 비교(==)로 잘못 친 오타 주입 ──────────
+        if (targetPatternId == 0 || targetPatternId == 17) {
+            if (const BinaryOperator* BinOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe482_assign")) {
+                // 'A = B;' 로 값을 업데이트해야 하는데, 'A == B;' 로 비교만 하고 넘어가버림
+                // 변수 업데이트가 누락되어 비정상적인 상태로 프로그램이 계속 돌아감
+                Rewrite.ReplaceText(BinOp->getOperatorLoc(), 1, "==");
+                mutations_log.push_back({17, "CWE-482 Comparing instead of Assigning", "injected"});
+            }
+        }
+
+        // ── [검증 완료] CWE-481: if문 내부에서 비교(==)를 대입(=)으로 오타 주입 ───────────────────────
+        if (targetPatternId == 0 || targetPatternId == 18) {
+            if (const BinaryOperator* CondOp = Result.Nodes.getNodeAs<BinaryOperator>("cwe481_cond")) {
+                // 'if (a == b)'를 'if (a = b)'로 변경
+                // 개발자가 가장 많이 하는 오타이며, 조건이 대입된 값에 따라 항상 참/거짓으로 고정되고 변수까지 오염됨
+                Rewrite.ReplaceText(CondOp->getOperatorLoc(), 2, "=");
+                mutations_log.push_back({18, "CWE-481 Assigning instead of Comparing", "injected"});
+            }
+        }
+
+        // ── [검증 완료] CWE-772: 파일 리소스 닫기 누락 주입 ──────────
+        if (targetPatternId == 0 || targetPatternId == 19) {
+            if (const CallExpr* Call = Result.Nodes.getNodeAs<CallExpr>("cwe772_call")) {
+                // 열어둔 파일을 닫는 fclose()를 실수로 지우거나 주석 처리한 상황 모방
+                // 메모리 누수와 달리 파일 디스크립터(FD) 고갈을 유발하여 퍼저에서 Hang(멈춤)을 발생시킴
+                Rewrite.ReplaceText(Call->getSourceRange(), "/* fclose omitted */");
+                mutations_log.push_back({19, "CWE-772 Missing Release of Resource", "injected"});
+            }
+        }
+
+        // ── [검증 완료] CWE-170: 문자열 널 종료(Null Termination) 누락 주입 ──────────
+        if (targetPatternId == 0 || targetPatternId == 20) {
+            if (const BinaryOperator* NullTerm = Result.Nodes.getNodeAs<BinaryOperator>("cwe170_nullterm")) {
+                // C/C++ 문자열 처리의 핵심인 'buf[len] = '\0';' 구문을 주석 처리함
+                // 이후 strlen이나 printf("%s")가 호출될 때 Out-of-bounds Read가 발생하여 크래시 유발
+                Rewrite.ReplaceText(NullTerm->getSourceRange(), "/* null termination omitted */");
+                mutations_log.push_back({20, "CWE-170 Improper Null Termination", "injected"});
+            }
+        }
         
     }
 
@@ -507,6 +581,72 @@ public:
             Finder.addMatcher(
                 cxxDeleteExpr(isExpansionInMainFile(),
                               hasAncestor(functionDecl().bind("parent_func"))).bind("cwe415_delete"),
+                &Callback);
+        }
+
+        // ── [추가] CWE-484: Switch 문 내부의 break 문 찾기 ──────────
+        if (all || patternId == 15) {
+            Finder.addMatcher(
+                breakStmt(isExpansionInMainFile(),
+                          hasAncestor(switchStmt()), // 반드시 switch 문 안에 있는 break만 타겟팅 (루프 방해 방지)
+                          hasAncestor(functionDecl().bind("parent_func"))).bind("cwe484_break"),
+                &Callback);
+        }
+
+        // ── [추가] CWE-676: 안전한 문자열 복사(strncpy) 함수 호출 찾기 ──────────
+        if (all || patternId == 16) {
+            Finder.addMatcher(
+                callExpr(isExpansionInMainFile(),
+                         callee(functionDecl(hasName("strncpy"))), // strncpy 명시적 탐색
+                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe676_call"),
+                &Callback);
+        }
+
+        // ── [추가] CWE-482: 조건문 밖에서의 단순 대입 연산자(=) 찾기 ──────────
+        if (all || patternId == 17) {
+            Finder.addMatcher(
+                binaryOperator(isExpansionInMainFile(),
+                               hasOperatorName("="),
+                               // CWE-416(UAF)과의 충돌 방지: 우항이 nullptr가 아닌 경우만 타겟팅
+                               hasRHS(unless(ignoringParenImpCasts(cxxNullPtrLiteralExpr()))),
+                               hasAncestor(compoundStmt()), // 조건식(if) 내부가 아닌 일반 블록 안의 대입만
+                               hasAncestor(functionDecl().bind("parent_func"))).bind("cwe482_assign"),
+                &Callback);
+        }
+
+        // ── [추가] CWE-481: if 조건문 내부에서 잘못된 비교(==) 찾기 ──────────
+        if (all || patternId == 18) {
+            Finder.addMatcher(
+                ifStmt(isExpansionInMainFile(),
+                       hasCondition(
+                           binaryOperator(hasOperatorName("=="),
+                                          // CWE-369(0으로 나누기 바이패스)와의 충돌 방지: 0과 비교하는 구문은 제외
+                                          unless(hasEitherOperand(ignoringParenImpCasts(integerLiteral(equals(0)))))
+                                         ).bind("cwe481_cond")
+                       ),
+                       hasAncestor(functionDecl().bind("parent_func"))).bind("cwe481_if"),
+                &Callback);
+        }
+
+        // ── [추가] CWE-772: 파일 닫기(fclose/close) 누락 찾기 ──────────
+        if (all || patternId == 19) {
+            Finder.addMatcher(
+                callExpr(isExpansionInMainFile(),
+                         callee(functionDecl(hasAnyName("fclose", "close"))),
+                         hasAncestor(functionDecl().bind("parent_func"))).bind("cwe772_call"),
+                &Callback);
+        }
+
+        // ── [추가] CWE-170: 문자열 배열의 널(Null) 종료 처리 누락 찾기 ──────────
+        if (all || patternId == 20) {
+            Finder.addMatcher(
+                binaryOperator(isExpansionInMainFile(),
+                               hasOperatorName("="),
+                               hasLHS(arraySubscriptExpr()), // 좌항이 배열 인덱스 접근 (예: buf[i])
+                               hasRHS(ignoringParenImpCasts(
+                                   anyOf(characterLiteral(equals(0)), integerLiteral(equals(0)))
+                               )), // 우항이 '\0' 또는 0
+                               hasAncestor(functionDecl().bind("parent_func"))).bind("cwe170_nullterm"),
                 &Callback);
         }
     
